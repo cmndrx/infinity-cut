@@ -1,7 +1,7 @@
 import React from "react";
-import {Audio, Video} from "@remotion/media";
-import {AbsoluteFill, Img, Sequence, staticFile, useCurrentFrame} from "remotion";
+import {AbsoluteFill, Html5Audio, Img, OffthreadVideo, Sequence, staticFile, useCurrentFrame} from "remotion";
 import {getAnimatedPropertyValue} from "./animation";
+import {getClipPlaybackRate} from "./clip-speed";
 import type {EditorClip, EditorProject, EditorTransition} from "./types";
 import {DEFAULT_CAPTION_STYLE, DEFAULT_TITLE_STYLE} from "./types";
 
@@ -123,13 +123,16 @@ const VisualClip: React.FC<{clip: EditorClip; frameOffset: number; audioMultipli
   const maskedTreatment = Boolean(clip.effects.enabled && clip.effects.maskEnabled && (clip.kind === "video" || clip.kind === "image"));
   const renderMedia = (mediaStyle: React.CSSProperties, withAudio: boolean) => {
     if (clip.kind === "video" && clip.src) {
+      const playbackRate = getClipPlaybackRate(clip);
       return (
-        <Video
+        <OffthreadVideo
           src={resolveMediaSource(clip.src)}
-          trimBefore={Math.max(0, clip.sourceStart + frameOffset)}
+          trimBefore={Math.max(0, clip.sourceStart + frameOffset * playbackRate)}
+          playbackRate={playbackRate}
+          preservePitch={clip.preservePitch ?? true}
           volume={(currentFrame) => withAudio ? clipAudioVolume(clip, currentFrame + frameOffset) * audioMultiplier : 0}
-          objectFit="cover"
-          style={mediaStyle}
+          pauseWhenBuffering={false}
+          style={{...mediaStyle, objectFit: "cover"}}
         />
       );
     }
@@ -226,7 +229,14 @@ export const EditorComposition: React.FC<EditorCompositionProps> = ({project}) =
           const trackMultiplier = trackAudible ? (track?.volume ?? 1) : 0;
           return (
             <Sequence key={clip.id} from={clip.start} durationInFrames={clip.duration}>
-              <Audio src={resolveMediaSource(clip.src)} trimBefore={clip.sourceStart} volume={(frame) => clipAudioVolume(clip, frame) * trackMultiplier} />
+              <Html5Audio
+                src={resolveMediaSource(clip.src)}
+                trimBefore={clip.sourceStart}
+                playbackRate={getClipPlaybackRate(clip)}
+                preservePitch={clip.preservePitch ?? true}
+                pauseWhenBuffering={false}
+                volume={(frame) => clipAudioVolume(clip, frame) * trackMultiplier}
+              />
             </Sequence>
           );
         }

@@ -1,8 +1,8 @@
-# Infinity Cut + Remotion VFX
+# Directors Cut Pro + Remotion VFX
 
 This repository contains a browser-based nonlinear video editor and the existing Remotion trailer compositions.
 
-## Infinity Cut editor
+## Directors Cut Pro editor
 
 Start the editing workspace:
 
@@ -10,10 +10,14 @@ Start the editing workspace:
 npm run dev
 ```
 
-`npm run editor` is available as an alias. Infinity Cut is a separate application from Remotion Studio; dragging clips onto a Remotion Studio timeline will not add them to an Infinity Cut sequence.
+`npm run editor` is available as an alias. Directors Cut Pro is a separate application from Remotion Studio; dragging clips onto a Remotion Studio timeline will not add them to a Directors Cut Pro sequence.
 
 The editor opens at `http://localhost:5173/editor.html` and includes:
 
+- Project Home with new, recent, duplicate, rename, delete, search, and reopen workflows
+- Blank-project presets for HD, 4K, vertical, and square sequences
+- Versioned multi-project browser storage with legacy-project migration and recovery history
+- Directors Cut Pro JSON project import and export
 - Multi-track video, caption, and audio timeline
 - Click-and-drag playhead scrubbing and frame stepping
 - Multi-select and marquee selection
@@ -28,6 +32,8 @@ The editor opens at `http://localhost:5173/editor.html` and includes:
 - Media metadata, timeline usage counts, master-clip rename, duplicate-import detection, and safe removal
 - Offline media placeholders plus relink and replace-footage workflows that update every linked timeline clip
 - Browser import, playhead insertion, and timeline drag-and-drop
+- Native video frame-rate detection with a clip-mismatch choice to change the sequence or keep its settings
+- Sequence retiming that preserves real-world edit positions when changing frame rate
 - Keyframe animation for position, scale, rotation, opacity, color, and blur with eased interpolation
 - Lumetri-style Color workspace with live luma/RGB scopes, creative looks, copy/paste grades, and full effect bypass
 - Temperature, tint, exposure, tonal-range, vibrance, hue, fade, sharpen, vignette, grain, glow, and blur controls
@@ -50,7 +56,7 @@ The editor opens at `http://localhost:5173/editor.html` and includes:
 - Timeline snapping and zoom
 - Undo and redo history
 - Remotion-powered program preview
-- Local project persistence and editable JSON project export
+- Debounced autosave with explicit save checkpoints and editable JSON project export
 
 Keyboard shortcuts:
 
@@ -82,12 +88,20 @@ npm run editor:build
 
 The output is written to `editor-dist/`.
 
+### Create and manage projects
+
+Directors Cut Pro opens on **Project Home**. Click **New project**, enter a name, choose a sequence preset and frame rate, then click **Create project**. The new project starts with an empty five-minute sequence, standard C1/V3/V2/V1/A1/A2 tracks, and organized media bins.
+
+Project Home keeps projects separately in this browser. Use each project card to reopen, duplicate, rename, or delete it. Existing projects created before Project Home are migrated automatically. Click the project name in the editor toolbar to save and return to Project Home.
+
+Use **Open project file** to import a Directors Cut Pro `.directors-cut.json` file, an older raw project, or a legacy `.infinity.json` file. The **Save** button creates an explicit local checkpoint, while normal edits autosave in the background. When checkpoints are available, the project card exposes a recovery-history action.
+
 ### Animate a property
 
 1. Select a clip and place the playhead over it.
 2. Click the diamond beside an Inspector property to create its first keyframe.
 3. Drag the playhead to another point inside the clip.
-4. Change the property value. Infinity Cut creates the next keyframe and animates between the two values.
+4. Change the property value. Directors Cut Pro creates the next keyframe and animates between the two values.
 
 Click a diamond on the timeline clip to seek to it. The arrows in the Inspector's Animation row move between keyframes. Click a filled property diamond to remove the keyframe at the current playhead position.
 
@@ -133,7 +147,7 @@ Use **Import SRT / VTT** in the Text tab to create timed C1 caption clips from a
 3. Click **Render video**. The dialog reports bundling, frame rendering, audio mixing, and completion progress.
 4. Click **Download MP4** or **Download WebM** when the render finishes. A running export can be cancelled safely.
 
-Video rendering runs through the local Remotion service included with `npm run dev` or `npm run editor`. Imported media is copied into the ignored `.infinity-cut/media/` workspace so it remains accessible to both the editor preview and renderer. Completed files are staged in `.infinity-cut/renders/` and downloaded through the Export dialog.
+Video rendering runs through the local Remotion service included with `npm run dev` or `npm run editor`. Imported media is copied into the editor's ignored local media workspace so it remains accessible to both the editor preview and renderer. Completed files are staged locally and downloaded through the Export dialog.
 
 ### Manage media
 
@@ -144,6 +158,8 @@ Open the **Project** tab to organize source footage into bins, switch between gr
 - Mark an item **Offline** to test missing-media behavior. Visual clips show a clear offline slate and linked audio is muted until the item is brought online or relinked.
 - Duplicate file imports are skipped using the source file's name, size, and modified time.
 - Media used by the timeline cannot be removed from the project accidentally; its usage count identifies the clips that must be removed or replaced first.
+
+When an imported video's native frame rate differs from the sequence, Directors Cut Pro shows a **Clip Mismatch Warning**. Choose **Change sequence settings** to adopt the clip's frame rate and retime existing edits without changing their real-world timing, or **Keep existing settings** to conform the clip to the current sequence. The detected source frame rate is also shown in Media details.
 
 ## Remotion Studio
 

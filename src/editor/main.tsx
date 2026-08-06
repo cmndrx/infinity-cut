@@ -1,6 +1,6 @@
 import React from "react";
 import {createRoot} from "react-dom/client";
-import {EditorApp} from "./App";
+import {ProjectHome} from "./ProjectHome";
 import "./editor.css";
 
 const root = document.getElementById("editor-root");
@@ -11,6 +11,6 @@ if (!root) {
 
 createRoot(root).render(
   <React.StrictMode>
-    <EditorApp />
+    <ProjectHome />
   </React.StrictMode>,
 );

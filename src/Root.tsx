@@ -47,7 +47,7 @@ export const RemotionRoot: React.FC = () => {
         height={1080}
       />
       <Composition
-        id="InfinityCutExport"
+        id="DirectorsCutProExport"
         component={EditorComposition}
         durationInFrames={sampleProject.durationInFrames}
         fps={sampleProject.fps}

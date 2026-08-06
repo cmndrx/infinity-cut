@@ -86,7 +86,7 @@ const publicJob = (job: RenderJob) => ({
   downloadUrl: job.stage === "complete" ? `/api/render/${job.id}/download` : undefined,
 });
 
-export const infinityCutRenderPlugin = (): Plugin => {
+export const directorsCutProRenderPlugin = (): Plugin => {
   const jobs = new Map<string, RenderJob>();
   let bundlePromise: Promise<string> | null = null;
 
@@ -130,7 +130,7 @@ export const infinityCutRenderPlugin = (): Plugin => {
         const inputProps = {project};
         const composition = await selectComposition({
           serveUrl,
-          id: "InfinityCutExport",
+          id: "DirectorsCutProExport",
           inputProps,
           logLevel: "warn",
         });
@@ -243,11 +243,11 @@ export const infinityCutRenderPlugin = (): Plugin => {
         try {
           const body = await readJson(request);
           if (!body.project || !Array.isArray(body.project.clips) || !Array.isArray(body.project.tracks) || body.project.durationInFrames < 1) {
-            return sendJson(response, 400, {error: "Invalid Infinity Cut project"});
+            return sendJson(response, 400, {error: "Invalid Directors Cut Pro project"});
           }
           const id = randomUUID();
           const format = body.format === "webm" ? "webm" : "mp4";
-          const baseName = safeFilename(body.project.name.toLowerCase()) || "infinity-cut-export";
+          const baseName = safeFilename(body.project.name.toLowerCase()) || "directors-cut-pro-export";
           const filename = `${baseName}-${id.slice(0, 8)}.${format}`;
           const job: RenderJob = {
             id,
@@ -297,7 +297,7 @@ export const infinityCutRenderPlugin = (): Plugin => {
   };
 
   return {
-    name: "infinity-cut-render-service",
+    name: "directors-cut-pro-render-service",
     configureServer(server) {
       install(server.middlewares, server.config.root);
     },

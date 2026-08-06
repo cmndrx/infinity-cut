@@ -66,7 +66,9 @@ import {
 } from "lucide-react";
 import {EditorComposition} from "./EditorComposition";
 import {getAnimatedPropertyValue, hasKeyframeAt, hasPropertyKeyframes} from "./animation";
-import {sampleProject} from "./project";
+import {applyClipSpeed, getClipPlaybackRate, getClipSourceSpan, MAX_PLAYBACK_RATE, MIN_PLAYBACK_RATE, playbackRateForDuration} from "./clip-speed";
+import {conformMediaToFrameRate, formatFrameRate, frameRatesMatch, normalizeFrameRate, retimeProjectForFrameRate} from "./frame-rate";
+import {createProjectFile, normalizeProject, saveStoredProject} from "./project-storage";
 import type {EditorClip, EditorProject, EditorTrack, EditorTransition, KeyframeProperty, MediaKind, ProjectMedia, TextStyle, TransitionType} from "./types";
 import {DEFAULT_CAPTION_STYLE, DEFAULT_EFFECTS, DEFAULT_TITLE_STYLE, DEFAULT_TRANSFORM} from "./types";
 
@@ -80,6 +82,22 @@ type ExportFormat = "mp4" | "webm";
 type ExportQuality = "draft" | "standard" | "high";
 type ExportResolution = "source" | "720p";
 type ExportRange = "sequence" | "selected";
+type FrameRateChoice = "change" | "keep";
+type FrameRateMismatch = {
+  mediaName: string;
+  mediaFps: number;
+  projectFps: number;
+  width?: number;
+  height?: number;
+};
+type SpeedDialogState = {
+  clipId: string;
+  sourceSpan: number;
+  speedPercent: number;
+  durationFrames: number;
+  ripple: boolean;
+  preservePitch: boolean;
+};
 type RenderJobStatus = {
   id: string;
   stage: "queued" | "bundling" | "rendering" | "complete" | "cancelled" | "error";
@@ -178,10 +196,12 @@ const formatBytes = (bytes: number) => bytes >= 1024 * 1024
 
 const formatTimecode = (frame: number, fps: number) => {
   const safe = Math.max(0, Math.round(frame));
-  const hours = Math.floor(safe / (fps * 3600));
-  const minutes = Math.floor((safe / (fps * 60)) % 60);
-  const seconds = Math.floor((safe / fps) % 60);
-  const frames = safe % fps;
+  const nominalFps = Math.max(1, Math.round(fps));
+  const totalSeconds = Math.floor(safe / fps);
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds / 60) % 60);
+  const seconds = totalSeconds % 60;
+  const frames = Math.min(nominalFps - 1, Math.max(0, Math.round(safe - totalSeconds * fps)));
   return [hours, minutes, seconds, frames].map((part) => String(part).padStart(2, "0")).join(":");
 };
 
@@ -236,40 +256,17 @@ const clipIcon = (kind: MediaKind, size = 13) => {
 const cloneProject = (project: EditorProject): EditorProject => JSON.parse(JSON.stringify(project)) as EditorProject;
 const cloneClip = (clip: EditorClip): EditorClip => JSON.parse(JSON.stringify(clip)) as EditorClip;
 
-const loadInitialProject = (): EditorProject => {
-  try {
-    const saved = localStorage.getItem("infinity-cut-project");
-    if (!saved) return cloneProject(sampleProject);
-    const parsed = JSON.parse(saved) as EditorProject;
-    if (!Array.isArray(parsed.tracks) || !Array.isArray(parsed.clips) || !parsed.fps) return cloneProject(sampleProject);
-    parsed.markers = Array.isArray(parsed.markers) ? parsed.markers : [];
-    parsed.transitions = Array.isArray(parsed.transitions) ? parsed.transitions : [];
-    parsed.mediaBins = Array.isArray(parsed.mediaBins) && parsed.mediaBins.length ? parsed.mediaBins : cloneProject(sampleProject).mediaBins;
-    parsed.media = Array.isArray(parsed.media) ? parsed.media : cloneProject(sampleProject).media;
-    parsed.media = parsed.media.map((item) => ({...item, binId: item.binId ?? parsed.mediaBins[0]?.id ?? "bin-video", offline: item.offline ?? (item.renderReady === false && item.src.startsWith("blob:"))}));
-    if (!parsed.tracks.some((track) => track.kind === "caption")) parsed.tracks.unshift({...C1_TRACK});
-    parsed.tracks = parsed.tracks.map((track) => ({...track, solo: track.solo ?? false, volume: track.volume ?? 1}));
-    parsed.clips = parsed.clips.map((clip) => ({
-      ...clip,
-      fadeIn: clip.fadeIn ?? 0,
-      fadeOut: clip.fadeOut ?? 0,
-      audioMuted: clip.audioMuted ?? false,
-      keyframes: Array.isArray(clip.keyframes) ? clip.keyframes : [],
-      sourceMediaId: clip.sourceMediaId ?? parsed.media.find((item) => item.src === clip.src)?.id,
-      effects: {...DEFAULT_EFFECTS, ...(clip.effects ?? {})},
-      textStyle: clip.kind === "title" ? {...DEFAULT_TITLE_STYLE, ...(clip.textStyle ?? {})} : clip.kind === "caption" ? {...DEFAULT_CAPTION_STYLE, ...(clip.textStyle ?? {})} : clip.textStyle,
-    }));
-    return parsed;
-  } catch {
-    return cloneProject(sampleProject);
-  }
+type EditorAppProps = {
+  projectId: string;
+  initialProject: EditorProject;
+  onBackToProjects: () => void;
 };
 
-export const EditorApp: React.FC = () => {
-  const [project, setProject] = useState<EditorProject>(loadInitialProject);
+export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, onBackToProjects}) => {
+  const [project, setProject] = useState<EditorProject>(() => normalizeProject(initialProject));
   const [past, setPast] = useState<EditorProject[]>([]);
   const [future, setFuture] = useState<EditorProject[]>([]);
-  const [selectedClipIds, setSelectedClipIds] = useState<string[]>(["video-2"]);
+  const [selectedClipIds, setSelectedClipIds] = useState<string[]>(() => initialProject.clips[0] ? [initialProject.clips[0].id] : []);
   const [selectedTransitionId, setSelectedTransitionId] = useState<string | null>(null);
   const [activeTool, setActiveTool] = useState<TimelineTool>("select");
   const [linkedSelection, setLinkedSelection] = useState(true);
@@ -304,6 +301,8 @@ export const EditorApp: React.FC = () => {
   const [exportRange, setExportRange] = useState<ExportRange>("sequence");
   const [renderJob, setRenderJob] = useState<RenderJobStatus | null>(null);
   const [renderStarting, setRenderStarting] = useState(false);
+  const [frameRateMismatch, setFrameRateMismatch] = useState<FrameRateMismatch | null>(null);
+  const [speedDialog, setSpeedDialog] = useState<SpeedDialogState | null>(null);
   const playerRef = useRef<PlayerRef>(null);
   const initialFrameRef = useRef(frame);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -318,12 +317,38 @@ export const EditorApp: React.FC = () => {
   const colorClipboardRef = useRef<EditorClip["effects"] | null>(null);
   const marqueeRef = useRef<MarqueeState | null>(null);
   const waveformRequestsRef = useRef<Set<string>>(new Set());
+  const frameRateChoiceResolverRef = useRef<((choice: FrameRateChoice) => void) | null>(null);
+
+  useEffect(() => {
+    const timeout = window.setTimeout(() => {
+      try {
+        saveStoredProject(projectId, project);
+        setToast("Autosaved just now");
+      } catch (error) {
+        setToast(error instanceof Error ? error.message : "Autosave failed");
+      }
+    }, 650);
+    return () => window.clearTimeout(timeout);
+  }, [project, projectId]);
+
+  useEffect(() => {
+    const saveBeforeClose = () => {
+      try {
+        saveStoredProject(projectId, project);
+      } catch {
+        // The visible autosave status reports storage failures during normal editing.
+      }
+    };
+    window.addEventListener("beforeunload", saveBeforeClose);
+    return () => window.removeEventListener("beforeunload", saveBeforeClose);
+  }, [project, projectId]);
 
   const pixelsPerFrame = zoom * 1.35;
   const timelineWidth = Math.max(940, project.durationInFrames * pixelsPerFrame + 120);
   const selectedClipId = selectedClipIds[selectedClipIds.length - 1] ?? null;
   const selectedClip = project.clips.find((clip) => clip.id === selectedClipId) ?? null;
   const selectedTransition = project.transitions.find((transition) => transition.id === selectedTransitionId) ?? null;
+  const playerInputProps = useMemo(() => ({project}), [project]);
   const binPointerDragId = binPointerDrag?.item.id;
   const marqueeActive = marquee !== null;
 
@@ -336,6 +361,72 @@ export const EditorApp: React.FC = () => {
       return next;
     });
     if (message) setToast(message);
+  }, []);
+
+  const openSpeedDialog = useCallback((clipId?: string) => {
+    const targetId = clipId ?? selectedClipId;
+    const clip = project.clips.find((candidate) => candidate.id === targetId);
+    const track = project.tracks.find((candidate) => candidate.id === clip?.trackId);
+    if (!clip || (clip.kind !== "video" && clip.kind !== "audio")) {
+      setToast("Select a video or audio clip to adjust speed");
+      return;
+    }
+    if (track?.locked) {
+      setToast(`Unlock ${track.name} to adjust clip speed`);
+      return;
+    }
+    const playbackRate = getClipPlaybackRate(clip);
+    setSpeedDialog({
+      clipId: clip.id,
+      sourceSpan: getClipSourceSpan(clip),
+      speedPercent: playbackRate * 100,
+      durationFrames: clip.duration,
+      ripple: true,
+      preservePitch: clip.preservePitch ?? true,
+    });
+    setContextMenu(null);
+  }, [project.clips, project.tracks, selectedClipId]);
+
+  const updateSpeedPercent = (value: number) => setSpeedDialog((current) => {
+    if (!current) return current;
+    const playbackRate = clamp(value / 100, MIN_PLAYBACK_RATE, MAX_PLAYBACK_RATE);
+    return {...current, speedPercent: playbackRate * 100, durationFrames: Math.max(2, Math.round(current.sourceSpan / playbackRate))};
+  });
+
+  const updateSpeedDuration = (durationFrames: number) => setSpeedDialog((current) => {
+    if (!current) return current;
+    const clip = project.clips.find((candidate) => candidate.id === current.clipId);
+    if (!clip) return current;
+    const safeDuration = Math.max(2, Math.round(durationFrames));
+    const playbackRate = playbackRateForDuration(clip, safeDuration);
+    return {...current, speedPercent: playbackRate * 100, durationFrames: Math.max(2, Math.round(current.sourceSpan / playbackRate))};
+  });
+
+  const applySpeedDialog = () => {
+    if (!speedDialog) return;
+    const playbackRate = clamp(speedDialog.speedPercent / 100, MIN_PLAYBACK_RATE, MAX_PLAYBACK_RATE);
+    commit((draft) => Object.assign(draft, applyClipSpeed(draft, speedDialog.clipId, playbackRate, {
+      ripple: speedDialog.ripple,
+      preservePitch: speedDialog.preservePitch,
+    })), `Changed clip speed to ${Math.round(playbackRate * 1000) / 10}%`);
+    setSpeedDialog(null);
+  };
+
+  const requestFrameRateChoice = useCallback((mismatch: FrameRateMismatch) => new Promise<FrameRateChoice>((resolve) => {
+    frameRateChoiceResolverRef.current = resolve;
+    setFrameRateMismatch(mismatch);
+  }), []);
+
+  const resolveFrameRateChoice = useCallback((choice: FrameRateChoice) => {
+    const resolve = frameRateChoiceResolverRef.current;
+    frameRateChoiceResolverRef.current = null;
+    setFrameRateMismatch(null);
+    resolve?.(choice);
+  }, []);
+
+  useEffect(() => () => {
+    frameRateChoiceResolverRef.current?.("keep");
+    frameRateChoiceResolverRef.current = null;
   }, []);
 
   const undo = useCallback(() => {
@@ -485,7 +576,7 @@ export const EditorApp: React.FC = () => {
       original.duration = splitOffset;
       original.fadeIn = Math.min(original.fadeIn, original.duration);
       original.fadeOut = 0;
-      draft.clips.push({...cloneClip(original), id: newId, name: `${original.name} B`, start: splitFrame, duration: clip.duration - splitOffset, sourceStart: clip.sourceStart + splitOffset, fadeIn: 0, fadeOut: Math.min(rightFadeOut, clip.duration - splitOffset), keyframes: rightKeyframes});
+      draft.clips.push({...cloneClip(original), id: newId, name: `${original.name} B`, start: splitFrame, duration: clip.duration - splitOffset, sourceStart: clip.sourceStart + splitOffset * getClipPlaybackRate(clip), fadeIn: 0, fadeOut: Math.min(rightFadeOut, clip.duration - splitOffset), keyframes: rightKeyframes});
     }, `Split ${clip.name} at ${formatTimecode(splitFrame, project.fps)}`);
     setSelectedClipIds([newId]);
     return newId;
@@ -572,7 +663,7 @@ export const EditorApp: React.FC = () => {
     }
     const existing = project.transitions.find((transition) => transition.fromClipId === from.id && transition.toClipId === to.id);
     const transitionId = existing?.id ?? `transition-${Date.now()}-${clipIdCounterRef.current++}`;
-    const duration = Math.max(2, Math.min(existing?.duration ?? project.fps, from.duration, to.duration));
+    const duration = Math.max(2, Math.min(existing?.duration ?? Math.round(project.fps), from.duration, to.duration));
     commit((draft) => {
       const transition = draft.transitions.find((item) => item.id === transitionId);
       if (transition) {
@@ -644,7 +735,7 @@ export const EditorApp: React.FC = () => {
       return;
     }
     const id = `${kind}-${Date.now()}-${clipIdCounterRef.current++}`;
-    const duration = kind === "caption" ? Math.max(60, project.fps * 3) : Math.max(75, project.fps * 3);
+    const duration = kind === "caption" ? Math.max(60, Math.round(project.fps * 3)) : Math.max(75, Math.round(project.fps * 3));
     const clip: EditorClip = {
       id,
       name: kind === "caption" ? "New caption" : "New title",
@@ -764,7 +855,8 @@ export const EditorApp: React.FC = () => {
 
   useEffect(() => {
     for (const clip of project.clips.filter((item) => item.kind === "audio" && item.src)) {
-      const requestKey = `${clip.id}:${clip.src}:${clip.sourceStart}:${clip.duration}`;
+      const playbackRate = getClipPlaybackRate(clip);
+      const requestKey = `${clip.id}:${clip.src}:${clip.sourceStart}:${clip.duration}:${playbackRate}`;
       if (waveformRequestsRef.current.has(requestKey)) continue;
       waveformRequestsRef.current.add(requestKey);
       void (async () => {
@@ -776,7 +868,7 @@ export const EditorApp: React.FC = () => {
           const decoded = await context.decodeAudioData(buffer);
           const channel = decoded.getChannelData(0);
           const startSample = Math.floor((clip.sourceStart / project.fps) * decoded.sampleRate);
-          const endSample = Math.min(channel.length, startSample + Math.floor((clip.duration / project.fps) * decoded.sampleRate));
+          const endSample = Math.min(channel.length, startSample + Math.floor(((clip.duration * playbackRate) / project.fps) * decoded.sampleRate));
           const peakCount = 96;
           const blockSize = Math.max(1, Math.floor((endSample - startSample) / peakCount));
           const peaks = Array.from({length: peakCount}, (_, index) => {
@@ -813,6 +905,9 @@ export const EditorApp: React.FC = () => {
       } else if (command && event.key.toLowerCase() === "d") {
         event.preventDefault();
         duplicateSelected();
+      } else if (command && event.key.toLowerCase() === "r") {
+        event.preventDefault();
+        openSpeedDialog();
       } else if (event.key === " " || event.code === "Space") {
         event.preventDefault();
         togglePlayback();
@@ -850,7 +945,7 @@ export const EditorApp: React.FC = () => {
     };
     window.addEventListener("keydown", keydown);
     return () => window.removeEventListener("keydown", keydown);
-  }, [addMarker, copySelected, deleteSelected, deleteSelectedTransition, duplicateSelected, frame, pasteClips, project.fps, redo, rippleDeleteSelected, seek, selectedTransitionId, splitSelected, togglePlayback, undo]);
+  }, [addMarker, copySelected, deleteSelected, deleteSelectedTransition, duplicateSelected, frame, openSpeedDialog, pasteClips, project.fps, redo, rippleDeleteSelected, seek, selectedTransitionId, splitSelected, togglePlayback, undo]);
 
   useEffect(() => {
     const isFileDrag = (event: DragEvent) => Array.from(event.dataTransfer?.types ?? []).includes("Files");
@@ -909,12 +1004,13 @@ export const EditorApp: React.FC = () => {
             if (candidate) candidate.start = initial.start + applied;
           }
         } else if (drag.mode === "trim-start" || drag.mode === "ripple-start") {
+          const playbackRate = getClipPlaybackRate(clip);
           const maxDelta = drag.initialDuration - 2;
           const desiredStart = snapValue(drag.initialStart + rawDelta);
-          const applied = clamp(desiredStart - drag.initialStart, -drag.initialSourceStart, maxDelta);
+          const applied = clamp(desiredStart - drag.initialStart, Math.ceil(-drag.initialSourceStart / playbackRate), maxDelta);
           clip.start = drag.initialStart + applied;
           clip.duration = drag.initialDuration - applied;
-          clip.sourceStart = drag.initialSourceStart + applied;
+          clip.sourceStart = drag.initialSourceStart + applied * playbackRate;
           clip.fadeIn = Math.min(clip.fadeIn, clip.duration);
           clip.fadeOut = Math.min(clip.fadeOut, Math.max(0, clip.duration - clip.fadeIn));
           clip.keyframes = (clip.keyframes ?? [])
@@ -941,10 +1037,10 @@ export const EditorApp: React.FC = () => {
             clip.duration = drag.initialDuration + applied;
             neighbor.start += applied;
             neighbor.duration -= applied;
-            neighbor.sourceStart += applied;
+            neighbor.sourceStart += applied * getClipPlaybackRate(neighbor);
           }
         } else if (drag.mode === "slip") {
-          clip.sourceStart = Math.max(0, drag.initialSourceStart + rawDelta);
+          clip.sourceStart = Math.max(0, drag.initialSourceStart + rawDelta * getClipPlaybackRate(clip));
         } else if (drag.mode === "slide") {
           const applied = Math.max(rawDelta, -drag.initialStart);
           const originalEnd = drag.initialStart + drag.initialDuration;
@@ -958,7 +1054,7 @@ export const EditorApp: React.FC = () => {
           if (following) {
             following.start += bounded;
             following.duration -= bounded;
-            following.sourceStart += bounded;
+            following.sourceStart += bounded * getClipPlaybackRate(following);
           }
         } else if (drag.mode === "fade-in") {
           clip.fadeIn = clamp(drag.initialFadeIn + rawDelta, 0, Math.max(0, clip.duration - drag.initialFadeOut));
@@ -1388,16 +1484,20 @@ export const EditorApp: React.FC = () => {
   };
 
   const saveProject = () => {
-    localStorage.setItem("infinity-cut-project", JSON.stringify(project));
-    setToast("Project saved locally");
+    try {
+      saveStoredProject(projectId, project, {manual: true});
+      setToast("Project saved locally");
+    } catch (error) {
+      setToast(error instanceof Error ? error.message : "Project could not be saved");
+    }
   };
 
   const exportProjectFile = () => {
-    const blob = new Blob([JSON.stringify(project, null, 2)], {type: "application/json"});
+    const blob = new Blob([JSON.stringify(createProjectFile(project), null, 2)], {type: "application/json"});
     const url = URL.createObjectURL(blob);
     const anchor = document.createElement("a");
     anchor.href = url;
-    anchor.download = `${project.name.toLowerCase().replace(/\s+/g, "-")}.infinity.json`;
+    anchor.download = `${project.name.toLowerCase().replace(/\s+/g, "-")}.directors-cut.json`;
     anchor.click();
     URL.revokeObjectURL(url);
     setToast("Editable project file exported");
@@ -1412,7 +1512,7 @@ export const EditorApp: React.FC = () => {
         progress: 0,
         message: "Re-import media before exporting",
         filename: "",
-        error: `${browserOnlyClips.length} ${browserOnlyClips.length === 1 ? "clip uses" : "clips use"} temporary browser media. Re-import the source file so Infinity Cut can make it available to the renderer.`,
+        error: `${browserOnlyClips.length} ${browserOnlyClips.length === 1 ? "clip uses" : "clips use"} temporary browser media. Re-import the source file so Directors Cut Pro can make it available to the renderer.`,
       });
       return;
     }
@@ -1485,15 +1585,15 @@ export const EditorApp: React.FC = () => {
     }
   };
 
-  const readMediaMetadata = async (src: string, kind: ProjectMedia["kind"]) => {
+  const readMediaMetadata = async (src: string, kind: ProjectMedia["kind"], file?: File) => {
     if (kind === "image") {
-      return await new Promise<{duration: number; width?: number; height?: number}>((resolve) => {
+      return await new Promise<{duration: number; durationInSeconds: number; width?: number; height?: number; fps?: number}>((resolve) => {
         const image = new Image();
         let settled = false;
         const finish = (width?: number, height?: number) => {
           if (settled) return;
           settled = true;
-          resolve({duration: project.fps * 5, width, height});
+          resolve({duration: Math.round(project.fps * 5), durationInSeconds: 5, width, height});
         };
         image.onload = () => finish(image.naturalWidth, image.naturalHeight);
         image.onerror = () => finish();
@@ -1501,16 +1601,42 @@ export const EditorApp: React.FC = () => {
         window.setTimeout(() => finish(), 1800);
       });
     }
-    return await new Promise<{duration: number; width?: number; height?: number}>((resolve) => {
+
+    let parsedFps: number | undefined;
+    let parsedDuration: number | undefined;
+    let parsedWidth: number | undefined;
+    let parsedHeight: number | undefined;
+    if (kind === "video" && file) {
+      try {
+        const {parseMedia} = await import("@remotion/media-parser");
+        const parsed = await parseMedia({
+          src: file,
+          fields: {fps: true, durationInSeconds: true, dimensions: true},
+          acknowledgeRemotionLicense: true,
+        });
+        parsedFps = normalizeFrameRate(parsed.fps);
+        parsedDuration = parsed.durationInSeconds && Number.isFinite(parsed.durationInSeconds) ? parsed.durationInSeconds : undefined;
+        parsedWidth = parsed.dimensions?.width;
+        parsedHeight = parsed.dimensions?.height;
+      } catch {
+        // Browser metadata remains a useful fallback for containers the parser cannot inspect.
+      }
+    }
+
+    return await new Promise<{duration: number; durationInSeconds?: number; width?: number; height?: number; fps?: number}>((resolve) => {
       const media = document.createElement(kind === "audio" ? "audio" : "video");
       let settled = false;
       const finish = () => {
         if (settled) return;
         settled = true;
-        const duration = Number.isFinite(media.duration) ? Math.max(2, Math.round(media.duration * project.fps)) : project.fps * 6;
-        const dimensions = kind === "video" ? {width: (media as HTMLVideoElement).videoWidth || undefined, height: (media as HTMLVideoElement).videoHeight || undefined} : {};
+        const durationInSeconds = parsedDuration ?? (Number.isFinite(media.duration) ? media.duration : undefined);
+        const duration = durationInSeconds ? Math.max(2, Math.round(durationInSeconds * project.fps)) : Math.round(project.fps * 6);
+        const dimensions = kind === "video" ? {
+          width: parsedWidth ?? ((media as HTMLVideoElement).videoWidth || undefined),
+          height: parsedHeight ?? ((media as HTMLVideoElement).videoHeight || undefined),
+        } : {};
         media.removeAttribute("src");
-        resolve({duration, ...dimensions});
+        resolve({duration, durationInSeconds, fps: parsedFps, ...dimensions});
       };
       media.preload = "metadata";
       media.onloadedmetadata = finish;
@@ -1522,8 +1648,11 @@ export const EditorApp: React.FC = () => {
 
   const fileToMediaItem = async (file: File, index: number, forcedBinId?: string): Promise<ProjectMedia> => {
     const kind: ProjectMedia["kind"] = file.type.startsWith("audio/") ? "audio" : file.type.startsWith("image/") ? "image" : "video";
-    const uploaded = await uploadMediaFile(file);
-    const metadata = await readMediaMetadata(uploaded.src, kind);
+    const previewSrc = URL.createObjectURL(file);
+    const [uploaded, metadata] = await Promise.all([
+      uploadMediaFile(file),
+      readMediaMetadata(previewSrc, kind, file),
+    ]).finally(() => URL.revokeObjectURL(previewSrc));
     return {
       id: `import-${Date.now()}-${index}-${clipIdCounterRef.current++}`,
       name: file.name,
@@ -1537,6 +1666,8 @@ export const EditorApp: React.FC = () => {
       mimeType: file.type || undefined,
       width: metadata.width,
       height: metadata.height,
+      fps: metadata.fps,
+      durationInSeconds: metadata.durationInSeconds,
       importedAt: Date.now(),
       fingerprint: `${file.name.toLowerCase()}:${file.size}:${file.lastModified}`,
       renderReady: uploaded.renderReady,
@@ -1545,6 +1676,26 @@ export const EditorApp: React.FC = () => {
   };
 
   const filesToMediaItems = async (files: File[], forcedBinId?: string) => Promise.all(files.map((file, index) => fileToMediaItem(file, index, forcedBinId)));
+
+  const conformImportedFrameRate = async (items: ProjectMedia[]) => {
+    const mismatch = items.find((item) => item.kind === "video" && item.fps && !frameRatesMatch(item.fps, project.fps));
+    if (!mismatch?.fps) return items;
+
+    const choice = await requestFrameRateChoice({
+      mediaName: mismatch.name,
+      mediaFps: mismatch.fps,
+      projectFps: project.fps,
+      width: mismatch.width,
+      height: mismatch.height,
+    });
+    if (choice === "keep") return items;
+
+    const nextFps = mismatch.fps;
+    const ratio = nextFps / project.fps;
+    commit((draft) => Object.assign(draft, retimeProjectForFrameRate(draft, nextFps)), `Sequence changed to ${formatFrameRate(nextFps)} fps`);
+    setFrame((current) => Math.max(0, Math.round(current * ratio)));
+    return items.map((item) => conformMediaToFrameRate(item, nextFps));
+  };
 
   const uniqueImportFiles = (files: File[]) => {
     const known = new Set(project.media.map((item) => item.fingerprint).filter(Boolean));
@@ -1563,8 +1714,9 @@ export const EditorApp: React.FC = () => {
 
   const importMedia = async (event: React.ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(event.target.files ?? []);
+    event.target.value = "";
     const {unique, duplicates} = uniqueImportFiles(files);
-    const additions = await filesToMediaItems(unique);
+    const additions = await conformImportedFrameRate(await filesToMediaItems(unique));
     if (additions.length) {
       commit((draft) => draft.media.unshift(...additions), `Imported ${additions.length} media ${additions.length === 1 ? "file" : "files"}`);
       setSelectedMediaId(additions[0].id);
@@ -1572,7 +1724,6 @@ export const EditorApp: React.FC = () => {
     const unavailable = additions.filter((item) => item.renderReady === false).length;
     const duplicateMessage = duplicates ? ` · skipped ${duplicates} duplicate${duplicates === 1 ? "" : "s"}` : "";
     setToast(additions.length ? `Imported ${additions.length}${duplicateMessage}${unavailable ? " · preview only" : " · ready to export"}` : `Skipped ${duplicates} duplicate${duplicates === 1 ? "" : "s"}`);
-    event.target.value = "";
   };
 
   const createBin = () => {
@@ -1693,7 +1844,7 @@ export const EditorApp: React.FC = () => {
     const files = Array.from(event.dataTransfer.files);
     if (!files.length) return;
     const {unique, duplicates} = uniqueImportFiles(files);
-    const additions = await filesToMediaItems(unique);
+    const additions = await conformImportedFrameRate(await filesToMediaItems(unique));
     if (additions.length) commit((draft) => draft.media.unshift(...additions));
     let cursor = start;
     let added = 0;
@@ -1710,6 +1861,7 @@ export const EditorApp: React.FC = () => {
   };
 
   const exportIsActive = Boolean(renderJob && ["queued", "bundling", "rendering"].includes(renderJob.stage));
+  const speedDialogClip = speedDialog ? project.clips.find((clip) => clip.id === speedDialog.clipId) : null;
   const exportScale = exportResolution === "720p" ? Math.min(1, 720 / project.height) : 1;
   const exportWidth = Math.max(2, Math.round((project.width * exportScale) / 2) * 2);
   const exportHeight = Math.max(2, Math.round((project.height * exportScale) / 2) * 2);
@@ -1717,6 +1869,58 @@ export const EditorApp: React.FC = () => {
 
   return (
     <div className="editor-shell">
+      {frameRateMismatch && (
+        <div className="frame-rate-overlay">
+          <section className="frame-rate-dialog" role="dialog" aria-modal="true" aria-labelledby="frame-rate-dialog-title">
+            <header>
+              <div className="frame-rate-dialog-icon"><Gauge size={19} /></div>
+              <div><strong id="frame-rate-dialog-title">Clip Mismatch Warning</strong><small>This clip does not match the sequence frame rate.</small></div>
+            </header>
+            <div className="frame-rate-clip">
+              <Film size={20} />
+              <div><strong>{frameRateMismatch.mediaName}</strong><span>{frameRateMismatch.width && frameRateMismatch.height ? `${frameRateMismatch.width} × ${frameRateMismatch.height} · ` : ""}{formatFrameRate(frameRateMismatch.mediaFps)} fps</span></div>
+            </div>
+            <div className="frame-rate-comparison">
+              <div><span>Current sequence</span><strong>{formatFrameRate(frameRateMismatch.projectFps)} fps</strong></div>
+              <ChevronRight size={16} />
+              <div><span>Imported clip</span><strong>{formatFrameRate(frameRateMismatch.mediaFps)} fps</strong></div>
+            </div>
+            <p>Change the sequence to match the clip? Existing edits will be retimed so their positions and durations stay at the same real-world time.</p>
+            <footer>
+              <button className="frame-rate-keep" onClick={() => resolveFrameRateChoice("keep")}>Keep existing settings</button>
+              <button className="frame-rate-change" onClick={() => resolveFrameRateChoice("change")}>Change sequence settings</button>
+            </footer>
+          </section>
+        </div>
+      )}
+      {speedDialog && speedDialogClip && (
+        <div className="speed-dialog-overlay" onPointerDown={(event) => event.target === event.currentTarget && setSpeedDialog(null)}>
+          <section className="speed-dialog" role="dialog" aria-modal="true" aria-labelledby="speed-dialog-title">
+            <header>
+              <div className="speed-dialog-icon"><Gauge size={19} /></div>
+              <div><strong id="speed-dialog-title">Clip Speed / Duration</strong><small>{speedDialogClip.name}</small></div>
+              <button onClick={() => setSpeedDialog(null)} title="Close speed controls"><X size={16} /></button>
+            </header>
+            <div className="speed-preset-row" aria-label="Speed presets">
+              {[25, 50, 100, 200, 400].map((preset) => <button className={Math.abs(speedDialog.speedPercent - preset) < 0.01 ? "active" : ""} key={preset} onClick={() => updateSpeedPercent(preset)}>{preset}%</button>)}
+            </div>
+            <div className="speed-fields">
+              <label><span>Speed</span><div><input aria-label="Clip speed percentage" type="number" min={MIN_PLAYBACK_RATE * 100} max={MAX_PLAYBACK_RATE * 100} step={1} value={Math.round(speedDialog.speedPercent * 10) / 10} onChange={(event) => updateSpeedPercent(Number(event.target.value))} /><i>%</i></div></label>
+              <label><span>Duration</span><div><input aria-label="Clip duration in seconds" type="number" min={2 / project.fps} step={1 / project.fps} value={Math.round((speedDialog.durationFrames / project.fps) * 1000) / 1000} onChange={(event) => updateSpeedDuration(Number(event.target.value) * project.fps)} /><i>sec</i></div><small>{formatTimecode(speedDialog.durationFrames, project.fps)} · {speedDialog.durationFrames} frames</small></label>
+            </div>
+            <label className="speed-slider"><span>Playback speed</span><input aria-label="Playback speed" type="range" min={25} max={400} step={1} value={clamp(speedDialog.speedPercent, 25, 400)} onChange={(event) => updateSpeedPercent(Number(event.target.value))} /></label>
+            <div className="speed-options">
+              <label><input type="checkbox" checked={speedDialog.ripple} onChange={(event) => setSpeedDialog((current) => current ? {...current, ripple: event.target.checked} : current)} /><span><strong>Ripple edit, shifting trailing clips</strong><small>Move later clips on this track when duration changes.</small></span></label>
+              <label><input type="checkbox" checked={speedDialog.preservePitch} onChange={(event) => setSpeedDialog((current) => current ? {...current, preservePitch: event.target.checked} : current)} /><span><strong>Maintain audio pitch</strong><small>Keep voices and music at their natural pitch.</small></span></label>
+            </div>
+            <footer>
+              <span>Source used: {Math.round((speedDialog.sourceSpan / project.fps) * 100) / 100}s</span>
+              <button onClick={() => setSpeedDialog(null)}>Cancel</button>
+              <button className="apply-speed" onClick={applySpeedDialog}>Apply</button>
+            </footer>
+          </section>
+        </div>
+      )}
       {exportOpen && (
         <div className="export-overlay" onPointerDown={(event) => event.target === event.currentTarget && setExportOpen(false)}>
           <section className="export-dialog" role="dialog" aria-modal="true" aria-labelledby="export-dialog-title">
@@ -1727,7 +1931,7 @@ export const EditorApp: React.FC = () => {
             </header>
             <div className="export-summary">
               <div className="export-summary-frame"><Film size={25} /><span>Sequence 01</span></div>
-              <div><strong>{project.name}</strong><span>{exportWidth} × {exportHeight}</span><span>{project.fps} fps · {formatTimecode(exportFrames, project.fps)}</span><span>{exportFormat === "mp4" ? "H.264 + AAC" : "VP9 + Opus"}</span></div>
+              <div><strong>{project.name}</strong><span>{exportWidth} × {exportHeight}</span><span>{formatFrameRate(project.fps)} fps · {formatTimecode(exportFrames, project.fps)}</span><span>{exportFormat === "mp4" ? "H.264 + AAC" : "VP9 + Opus"}</span></div>
             </div>
             <div className="export-settings">
               <label><span>Format</span><select aria-label="Export format" disabled={exportIsActive || renderStarting} value={exportFormat} onChange={(event) => setExportFormat(event.target.value as ExportFormat)}><option value="mp4">MP4 (H.264)</option><option value="webm">WebM (VP9)</option></select></label>
@@ -1768,6 +1972,7 @@ export const EditorApp: React.FC = () => {
         <div className="clip-context-menu" style={{left: contextMenu.x, top: contextMenu.y}} onPointerDown={(event) => event.stopPropagation()}>
           <strong>Clip actions</strong>
           <button onClick={() => {splitClipAt(contextMenu.clipId, frame); setContextMenu(null);}}><Scissors size={13} /> Split at playhead <kbd>S</kbd></button>
+          <button onClick={() => openSpeedDialog(contextMenu.clipId)}><Gauge size={13} /> Speed / Duration <kbd>⌘R</kbd></button>
           <button onClick={() => {addTransition("cross-dissolve", contextMenu.clipId); setContextMenu(null);}}><Layers3 size={13} /> Add cross dissolve</button>
           <button onClick={() => {copySelected(); setContextMenu(null);}}><Copy size={13} /> Copy <kbd>⌘C</kbd></button>
           <button onClick={() => {duplicateSelected(); setContextMenu(null);}}><Copy size={13} /> Duplicate <kbd>⌘D</kbd></button>
@@ -1779,8 +1984,8 @@ export const EditorApp: React.FC = () => {
         </div>
       )}
       <header className="topbar">
-        <div className="brand-lockup"><div className="brand-mark"><Clapperboard size={16} /></div><span>INFINITY <b>CUT</b></span></div>
-        <div className="project-title"><span>{project.name}</span><ChevronDown size={13} /><i>{toast}</i></div>
+        <div className="brand-lockup"><div className="brand-mark"><Clapperboard size={16} /></div><span>DIRECTORS <b>CUT PRO</b></span></div>
+        <button className="project-title" onClick={() => {saveProject(); onBackToProjects();}} title="Back to projects"><span>{project.name}</span><ChevronDown size={13} /><i>{toast}</i></button>
         <div className="top-actions">
           <button className="icon-button" onClick={undo} disabled={!past.length} title="Undo (⌘Z)"><Undo2 size={16} /></button>
           <button className="icon-button" onClick={redo} disabled={!future.length} title="Redo (⇧⌘Z)"><Redo2 size={16} /></button>
@@ -1879,6 +2084,7 @@ export const EditorApp: React.FC = () => {
                     <span>Duration <b>{formatTimecode(selectedMedia.duration, project.fps)}</b></span>
                     <span>Used <b>{mediaUseCounts[selectedMedia.id] ?? 0}×</b></span>
                     <span>Frame <b>{selectedMedia.width && selectedMedia.height ? `${selectedMedia.width} × ${selectedMedia.height}` : "—"}</b></span>
+                    <span>Frame rate <b>{selectedMedia.fps ? `${formatFrameRate(selectedMedia.fps)} fps` : "—"}</b></span>
                     <span>Size <b>{selectedMedia.fileSize ? formatBytes(selectedMedia.fileSize) : "Bundled"}</b></span>
                   </div>
                   <label className="media-bin-select"><span>Bin</span><select value={selectedMedia.binId} onChange={(event) => moveMediaToBin(selectedMedia.id, event.target.value)}>{project.mediaBins.map((bin) => <option key={bin.id} value={bin.id}>{bin.name}</option>)}</select></label>
@@ -2018,7 +2224,7 @@ export const EditorApp: React.FC = () => {
               <Player
                 ref={playerRef}
                 component={EditorComposition}
-                inputProps={{project}}
+                inputProps={playerInputProps}
                 durationInFrames={project.durationInFrames}
                 fps={project.fps}
                 compositionWidth={project.width}
@@ -2091,6 +2297,15 @@ export const EditorApp: React.FC = () => {
                 <button onClick={() => seekAdjacentKeyframe(1)} title="Next keyframe"><ChevronRight size={13} /></button>
               </div>
               {(selectedClip.kind === "audio" || selectedClip.kind === "video") && (
+                <InspectorSection title="Speed / Duration" icon={<Gauge size={14} />}>
+                  <div className="clip-speed-summary">
+                    <span><small>Speed</small><strong>{Math.round(getClipPlaybackRate(selectedClip) * 1000) / 10}%</strong></span>
+                    <span><small>Duration</small><strong>{formatTimecode(selectedClip.duration, project.fps)}</strong></span>
+                  </div>
+                  <button className="open-speed-dialog" onClick={() => openSpeedDialog(selectedClip.id)}><Gauge size={13} /> Speed / Duration… <kbd>⌘R</kbd></button>
+                </InspectorSection>
+              )}
+              {(selectedClip.kind === "audio" || selectedClip.kind === "video") && (
                 <InspectorSection title="Audio" icon={<AudioWaveform size={14} />}>
                   <Slider label="Clip gain" value={linearToDb(propertyValue("audio", "volume"))} min={-60} max={12} step={0.5} suffix=" dB" keyframe={keyframeState("audio", "volume")} onToggleKeyframe={() => togglePropertyKeyframe("audio", "volume")} onChange={(value) => updateSelected("audio", "volume", dbToLinear(value))} />
                   <div className="property-grid audio-properties">
@@ -2145,7 +2360,7 @@ export const EditorApp: React.FC = () => {
               <button className={snap ? "active" : ""} onClick={() => setSnap((value) => !value)} title="Snap to clips, markers, and playhead"><Magnet size={15} /></button>
               <button className={linkedSelection ? "active" : ""} onClick={() => setLinkedSelection((value) => !value)} title="Linked selection"><Link2 size={15} /></button>
             </div>
-            <div className="sequence-title"><Layers3 size={14} /> Sequence 01 <span>{selectedClipIds.length ? `${selectedClipIds.length} selected` : `${project.width} × ${project.height} · ${project.fps} fps`}</span></div>
+            <div className="sequence-title"><Layers3 size={14} /> Sequence 01 <span>{selectedClipIds.length ? `${selectedClipIds.length} selected` : `${project.width} × ${project.height} · ${formatFrameRate(project.fps)} fps`}</span></div>
             <div className="zoom-control"><ZoomOut size={14} /><input type="range" min="0.55" max="3.4" step="0.05" value={zoom} onChange={(event) => setZoom(Number(event.target.value))} /><ZoomIn size={14} /></div>
           </div>
           <div className="timeline-body">
@@ -2220,6 +2435,7 @@ export const EditorApp: React.FC = () => {
                           <button className="trim-handle left" onPointerDown={(event) => beginDrag(event, clip, activeTool === "ripple" ? "ripple-start" : "trim-start")} />
                           <span className="clip-icon">{clipIcon(clip.kind)}</span><b>{clip.name}</b>
                           {clip.linkedGroupId && <Link2 className="linked-badge" size={10} />}
+                          {Math.abs(getClipPlaybackRate(clip) - 1) > 0.001 && <span className="clip-speed-badge">{Math.round(getClipPlaybackRate(clip) * 100)}%</span>}
                           {clip.kind === "audio" && <>
                             <span className="waveform waveform-bars">{(waveforms[clip.id] ?? [0.2, 0.48, 0.82, 0.34, 0.68, 0.92, 0.44, 0.3, 0.78, 0.62, 0.24, 0.5, 0.88, 0.58, 0.32, 0.74]).map((peak, index) => <i key={index} style={{height: `${Math.max(10, peak * 100)}%`}} />)}</span>
                             {clip.fadeIn > 0 && <span className="audio-fade-region in" style={{width: `${(clip.fadeIn / Math.max(1, clip.duration)) * 100}%`}} />}

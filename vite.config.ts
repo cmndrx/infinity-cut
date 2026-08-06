@@ -1,8 +1,8 @@
 import {defineConfig} from "vite";
-import {infinityCutRenderPlugin} from "./render-server";
+import {directorsCutProRenderPlugin} from "./render-server";
 
 export default defineConfig({
-  plugins: [infinityCutRenderPlugin()],
+  plugins: [directorsCutProRenderPlugin()],
   publicDir: "public",
   resolve: {
     dedupe: ["react", "react-dom", "remotion"],

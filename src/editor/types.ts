@@ -114,6 +114,8 @@ export type EditorClip = {
   fadeIn: number;
   fadeOut: number;
   audioMuted: boolean;
+  playbackRate?: number;
+  preservePitch?: boolean;
   transform: Transform;
   effects: Effects;
   keyframes: ClipKeyframe[];
@@ -141,6 +143,8 @@ export type ProjectMedia = {
   mimeType?: string;
   width?: number;
   height?: number;
+  fps?: number;
+  durationInSeconds?: number;
   importedAt?: number;
   fingerprint?: string;
   renderReady?: boolean;
