@@ -67,7 +67,7 @@ import {
 import {EditorComposition} from "./EditorComposition";
 import {getAnimatedPropertyValue, hasKeyframeAt, hasPropertyKeyframes} from "./animation";
 import {getClipPlaybackRate, getClipSourceSpan, MAX_PLAYBACK_RATE, MIN_PLAYBACK_RATE, playbackRateForDuration} from "./clip-speed";
-import {retimeClip, rippleDelete, splitClip} from "./core";
+import {cloneClips, moveClips, placeMedia, retimeClip, rippleDelete, splitClip, trimClip, type CommandResult} from "./core";
 import {conformMediaToFrameRate, formatFrameRate, frameRatesMatch, normalizeFrameRate, retimeProjectForFrameRate} from "./frame-rate";
 import {createProjectFile, normalizeProject, saveStoredProject} from "./project-storage";
 import type {EditorClip, EditorProject, EditorTrack, EditorTransition, KeyframeProperty, MediaKind, ProjectMedia, TextStyle, TransitionType} from "./types";
@@ -111,6 +111,7 @@ type RenderJobStatus = {
 };
 type PropertyGroup = "transform" | "effects" | "audio";
 type TimelineTool = "select" | "razor" | "ripple" | "roll" | "slip" | "slide";
+type EditMode = "insert" | "overwrite";
 type DragMode = "move" | "trim-start" | "trim-end" | "ripple-start" | "ripple-end" | "roll-end" | "slip" | "slide" | "fade-in" | "fade-out";
 type DragState = {
   clipId: string;
@@ -138,6 +139,7 @@ type BinPointerDrag = {
   y: number;
   active: boolean;
 };
+type ClipboardPackage = {clips: EditorClip[]; transitions: EditorTransition[]};
 type MarqueeState = {
   startX: number;
   startY: number;
@@ -265,12 +267,20 @@ type EditorAppProps = {
 
 export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, onBackToProjects}) => {
   const [project, setProject] = useState<EditorProject>(() => normalizeProject(initialProject));
+  const projectRef = useRef(project);
+  projectRef.current = project;
   const [past, setPast] = useState<EditorProject[]>([]);
   const [future, setFuture] = useState<EditorProject[]>([]);
   const [selectedClipIds, setSelectedClipIds] = useState<string[]>(() => initialProject.clips[0] ? [initialProject.clips[0].id] : []);
   const [selectedTransitionId, setSelectedTransitionId] = useState<string | null>(null);
   const [activeTool, setActiveTool] = useState<TimelineTool>("select");
   const [linkedSelection, setLinkedSelection] = useState(true);
+  const [editMode, setEditMode] = useState<EditMode>("overwrite");
+  const [trackTargets, setTrackTargets] = useState<Record<EditorTrack["kind"], string>>(() => ({
+    video: initialProject.tracks.find((track) => track.id === "v2")?.id ?? initialProject.tracks.find((track) => track.kind === "video")?.id ?? "",
+    audio: initialProject.tracks.find((track) => track.id === "a1")?.id ?? initialProject.tracks.find((track) => track.kind === "audio")?.id ?? "",
+    caption: initialProject.tracks.find((track) => track.kind === "caption")?.id ?? "",
+  }));
   const [frame, setFrame] = useState(105);
   const [isPlaying, setIsPlaying] = useState(false);
   const [zoom, setZoom] = useState(1.45);
@@ -312,15 +322,17 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
   const subtitleInputRef = useRef<HTMLInputElement>(null);
   const timelineScrollerRef = useRef<HTMLDivElement>(null);
   const dragOriginProjectRef = useRef<EditorProject | null>(null);
+  const dragPreviewProjectRef = useRef<EditorProject | null>(null);
   const clipIdCounterRef = useRef(0);
   const binPointerDragRef = useRef<BinPointerDrag | null>(null);
-  const clipboardRef = useRef<EditorClip[]>([]);
+  const clipboardRef = useRef<ClipboardPackage>({clips: [], transitions: []});
   const colorClipboardRef = useRef<EditorClip["effects"] | null>(null);
   const marqueeRef = useRef<MarqueeState | null>(null);
   const waveformRequestsRef = useRef<Set<string>>(new Set());
   const frameRateChoiceResolverRef = useRef<((choice: FrameRateChoice) => void) | null>(null);
 
   useEffect(() => {
+    if (drag) return;
     const timeout = window.setTimeout(() => {
       try {
         saveStoredProject(projectId, project);
@@ -330,19 +342,33 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
       }
     }, 650);
     return () => window.clearTimeout(timeout);
-  }, [project, projectId]);
+  }, [drag, project, projectId]);
 
   useEffect(() => {
     const saveBeforeClose = () => {
       try {
-        saveStoredProject(projectId, project);
+        saveStoredProject(projectId, dragOriginProjectRef.current ?? projectRef.current);
       } catch {
         // The visible autosave status reports storage failures during normal editing.
       }
     };
     window.addEventListener("beforeunload", saveBeforeClose);
     return () => window.removeEventListener("beforeunload", saveBeforeClose);
-  }, [project, projectId]);
+  }, [projectId]);
+
+  useEffect(() => {
+    setTrackTargets((current) => {
+      const next = {...current};
+      let changed = false;
+      for (const kind of ["video", "audio", "caption"] as const) {
+        if (!project.tracks.some((track) => track.id === next[kind] && track.kind === kind)) {
+          next[kind] = project.tracks.find((track) => track.kind === kind)?.id ?? "";
+          changed = true;
+        }
+      }
+      return changed ? next : current;
+    });
+  }, [project.tracks]);
 
   const pixelsPerFrame = zoom * 1.35;
   const timelineWidth = Math.max(940, project.durationInFrames * pixelsPerFrame + 120);
@@ -363,6 +389,23 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
     });
     if (message) setToast(message);
   }, []);
+
+  const applyKernelResult = useCallback((result: CommandResult, message: string, before = project) => {
+    if (!result.ok) {
+      setProject(cloneProject(before));
+      setToast(result.error.message);
+      return false;
+    }
+    if (!result.changed) {
+      setProject(cloneProject(before));
+      return false;
+    }
+    setProject(result.project);
+    setPast((items) => [...items.slice(-49), cloneProject(before)]);
+    setFuture([]);
+    setToast(message);
+    return true;
+  }, [project]);
 
   const openSpeedDialog = useCallback((clipId?: string) => {
     const targetId = clipId ?? selectedClipId;
@@ -581,39 +624,39 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
   const duplicateSelected = useCallback(() => {
     const selected = project.clips.filter((clip) => selectedClipIds.includes(clip.id));
     if (!selected.length) return;
-    const minStart = Math.min(...selected.map((clip) => clip.start));
     const maxEnd = Math.max(...selected.map((clip) => clip.start + clip.duration));
-    const newIds: string[] = [];
-    commit((draft) => {
-      for (const clip of selected) {
-        const id = `${clip.id}-copy-${Date.now()}-${clipIdCounterRef.current++}`;
-        newIds.push(id);
-        draft.clips.push({...cloneClip(clip), id, name: `${clip.name} copy`, start: maxEnd + (clip.start - minStart), linkedGroupId: undefined});
-      }
-      draft.durationInFrames = Math.max(draft.durationInFrames, maxEnd + (maxEnd - minStart));
-    }, `Duplicated ${selected.length} ${selected.length === 1 ? "clip" : "clips"}`);
-    setSelectedClipIds(newIds);
-  }, [commit, project.clips, selectedClipIds]);
+    const transitions = project.transitions.filter((transition) => selectedClipIds.includes(transition.fromClipId) && selectedClipIds.includes(transition.toClipId));
+    const result = cloneClips(project, {clips: selected, transitions, atFrame: maxEnd, idBase: "duplicate"});
+    if (applyKernelResult(result, `Duplicated ${selected.length} ${selected.length === 1 ? "clip" : "clips"}`) && result.ok) setSelectedClipIds(result.createdClipIds);
+  }, [applyKernelResult, project, selectedClipIds]);
 
   const copySelected = useCallback(() => {
-    clipboardRef.current = project.clips.filter((clip) => selectedClipIds.includes(clip.id)).map(cloneClip);
-    if (clipboardRef.current.length) setToast(`Copied ${clipboardRef.current.length} ${clipboardRef.current.length === 1 ? "clip" : "clips"}`);
-  }, [project.clips, selectedClipIds]);
+    const clips = project.clips.filter((clip) => selectedClipIds.includes(clip.id)).map(cloneClip);
+    clipboardRef.current = {
+      clips,
+      transitions: project.transitions.filter((transition) => selectedClipIds.includes(transition.fromClipId) && selectedClipIds.includes(transition.toClipId)).map((transition) => ({...transition})),
+    };
+    if (clips.length) setToast(`Copied ${clips.length} ${clips.length === 1 ? "clip" : "clips"}`);
+  }, [project.clips, project.transitions, selectedClipIds]);
 
   const pasteClips = useCallback(() => {
-    if (!clipboardRef.current.length) return;
-    const minStart = Math.min(...clipboardRef.current.map((clip) => clip.start));
-    const newIds: string[] = [];
-    commit((draft) => {
-      for (const copied of clipboardRef.current) {
-        const id = `${copied.id}-paste-${Date.now()}-${clipIdCounterRef.current++}`;
-        newIds.push(id);
-        draft.clips.push({...cloneClip(copied), id, name: `${copied.name} copy`, start: frame + copied.start - minStart, linkedGroupId: undefined});
+    const {clips, transitions} = clipboardRef.current;
+    if (!clips.length) return;
+    const trackMap: Record<string, string> = {};
+    for (const kind of ["video", "audio", "caption"] as const) {
+      const kindTracks = project.tracks.filter((track) => track.kind === kind);
+      const sourceTrackIds = Array.from(new Set(clips.map((clip) => clip.trackId).filter((trackId) => kindTracks.some((track) => track.id === trackId))));
+      if (!sourceTrackIds.length) continue;
+      const targetIndex = kindTracks.findIndex((track) => track.id === trackTargets[kind]);
+      const anchorIndex = Math.min(...sourceTrackIds.map((trackId) => kindTracks.findIndex((track) => track.id === trackId)));
+      for (const sourceTrackId of sourceTrackIds) {
+        const relativeIndex = kindTracks.findIndex((track) => track.id === sourceTrackId) - anchorIndex;
+        trackMap[sourceTrackId] = kindTracks[targetIndex + relativeIndex]?.id ?? "__invalid-track-target__";
       }
-      draft.durationInFrames = Math.max(draft.durationInFrames, ...draft.clips.map((clip) => clip.start + clip.duration));
-    }, `Pasted ${clipboardRef.current.length} ${clipboardRef.current.length === 1 ? "clip" : "clips"}`);
-    setSelectedClipIds(newIds);
-  }, [commit, frame]);
+    }
+    const result = cloneClips(project, {clips, transitions, atFrame: frame, trackMap, idBase: "paste"});
+    if (applyKernelResult(result, `Pasted ${clips.length} ${clips.length === 1 ? "clip" : "clips"}`) && result.ok) setSelectedClipIds(result.createdClipIds);
+  }, [applyKernelResult, frame, project, trackTargets]);
 
   const linkSelectedClips = useCallback(() => {
     if (selectedClipIds.length < 2) {
@@ -684,39 +727,20 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
       setToast(track?.locked ? `${track.name} is locked` : `${item.name} is not compatible with ${track?.name ?? "that track"}`);
       return null;
     }
-    const id = `clip-${Date.now()}-${clipIdCounterRef.current++}`;
     const safeStart = Math.max(0, Math.round(start));
-    const clip: EditorClip = {
-      id,
-      name: item.name,
-      kind: item.kind,
-      trackId: targetTrack,
-      start: safeStart,
-      duration: item.duration,
-      sourceStart: 0,
-      src: item.src,
-      color: item.color,
-      volume: item.kind === "audio" ? 0.65 : 0.8,
-      fadeIn: 0,
-      fadeOut: 0,
-      audioMuted: false,
-      transform: {...DEFAULT_TRANSFORM},
-      effects: {...DEFAULT_EFFECTS},
-      keyframes: [],
-      sourceMediaId: item.id,
-    };
-    commit((draft) => {
-      draft.clips.push(clip);
-      draft.durationInFrames = Math.max(draft.durationInFrames, safeStart + item.duration);
-    }, message ? `Added ${item.name} to ${track.name}` : undefined);
-    setSelectedClipIds([id]);
-    return id;
-  }, [commit, project.tracks]);
+    const result = placeMedia(project, {mode: editMode, atFrame: safeStart, items: [{mediaId: item.id, trackId: targetTrack}], idBase: "media"});
+    if (!applyKernelResult(result, message ? `${editMode === "insert" ? "Inserted" : "Overwrote with"} ${item.name} on ${track.name}` : "Media placement applied")) return null;
+    if (!result.ok) return null;
+    const id = result.createdClipIds.find((clipId) => result.project.clips.some((clip) => clip.id === clipId && clip.sourceMediaId === item.id)) ?? result.createdClipIds[0];
+    if (id) setSelectedClipIds([id]);
+    return id ?? null;
+  }, [applyKernelResult, editMode, project]);
 
   const addMediaToTimeline = useCallback((item: MediaItem) => {
-    const targetTrack = item.kind === "audio" ? "a1" : "v2";
+    const kind = clipTrackKind(item.kind);
+    const targetTrack = trackTargets[kind] || project.tracks.find((track) => track.kind === kind && !track.locked)?.id || "";
     addMediaAt(item, targetTrack, frame);
-  }, [addMediaAt, frame]);
+  }, [addMediaAt, frame, project.tracks, trackTargets]);
 
   const addTextClip = useCallback((kind: "title" | "caption") => {
     const targetTrack = kind === "caption" ? project.tracks.find((track) => track.kind === "caption") : project.tracks.find((track) => track.id === "v3") ?? project.tracks.find((track) => track.kind === "video");
@@ -963,7 +987,7 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
       const originProject = dragOriginProjectRef.current;
       if (!originProject) return;
       const movingIds = new Set(drag.selected.map((item) => item.id));
-      const snapCandidates = [0, frame, ...project.markers.map((marker) => marker.frame), ...originProject.clips.filter((clip) => !movingIds.has(clip.id)).flatMap((clip) => [clip.start, clip.start + clip.duration])];
+      const snapCandidates = [0, frame, ...originProject.markers.map((marker) => marker.frame), ...originProject.clips.filter((clip) => !movingIds.has(clip.id)).flatMap((clip) => [clip.start, clip.start + clip.duration])];
       const snapValue = (value: number) => {
         if (!snap) return value;
         const threshold = Math.max(2, Math.round(8 / pixelsPerFrame));
@@ -998,7 +1022,7 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
           const maxDelta = drag.initialDuration - 2;
           const desiredStart = snapValue(drag.initialStart + rawDelta);
           const applied = clamp(desiredStart - drag.initialStart, Math.ceil(-drag.initialSourceStart / playbackRate), maxDelta);
-          clip.start = drag.initialStart + applied;
+          clip.start = drag.mode === "trim-start" ? drag.initialStart + applied : drag.initialStart;
           clip.duration = drag.initialDuration - applied;
           clip.sourceStart = drag.initialSourceStart + applied * playbackRate;
           clip.fadeIn = Math.min(clip.fadeIn, clip.duration);
@@ -1007,7 +1031,8 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
             .map((keyframe) => ({...keyframe, frame: keyframe.frame - applied}))
             .filter((keyframe) => keyframe.frame >= 0 && keyframe.frame < clip.duration);
           if (drag.mode === "ripple-start") {
-            for (const other of next.clips) if (other.trackId === clip.trackId && other.id !== clip.id && other.start < drag.initialStart) other.duration = Math.max(2, other.duration + applied);
+            const originalEnd = drag.initialStart + drag.initialDuration;
+            for (const other of next.clips) if (other.trackId === clip.trackId && other.id !== clip.id && other.start >= originalEnd) other.start -= applied;
           }
         } else if (drag.mode === "trim-end" || drag.mode === "ripple-end") {
           const desiredEnd = snapValue(drag.initialStart + drag.initialDuration + rawDelta);
@@ -1052,48 +1077,94 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
           clip.fadeOut = clamp(drag.initialFadeOut - rawDelta, 0, Math.max(0, clip.duration - drag.initialFadeIn));
         }
         next.durationInFrames = Math.max(next.durationInFrames, ...next.clips.map((item) => item.start + item.duration));
+        dragPreviewProjectRef.current = next;
         return next;
       });
     };
     const onUp = (event: PointerEvent) => {
       const origin = dragOriginProjectRef.current;
+      const preview = dragPreviewProjectRef.current;
       const hoveredLane = (document.elementFromPoint(event.clientX, event.clientY) as HTMLElement | null)?.closest<HTMLElement>(".track-lane");
       const targetTrackId = hoveredLane?.dataset.trackId;
-      if (origin && drag.mode === "move" && targetTrackId) {
-        const targetIndex = project.tracks.findIndex((track) => track.id === targetTrackId);
-        const originIndex = project.tracks.findIndex((track) => track.id === drag.selected.find((item) => item.id === drag.clipId)?.trackId);
-        const trackDelta = targetIndex - originIndex;
-        setProject((current) => {
-          const next = cloneProject(current);
-          for (const initial of drag.selected) {
-            const clip = next.clips.find((item) => item.id === initial.id);
-            const oldIndex = project.tracks.findIndex((track) => track.id === initial.trackId);
-            const candidateTrack = project.tracks[oldIndex + trackDelta];
-            const currentKind = clip ? clipTrackKind(clip.kind) : null;
-            if (clip && candidateTrack && candidateTrack.kind === currentKind && !candidateTrack.locked) clip.trackId = candidateTrack.id;
+      if (origin && preview && drag.mode === "move") {
+        const originClip = origin.clips.find((clip) => clip.id === drag.clipId);
+        const previewClip = preview.clips.find((clip) => clip.id === drag.clipId);
+        const trackAssignments: Record<string, string> = {};
+        if (originClip && targetTrackId) {
+          const originTrack = origin.tracks.find((track) => track.id === originClip.trackId);
+          const targetTrack = origin.tracks.find((track) => track.id === targetTrackId);
+          if (originTrack && targetTrack && originTrack.kind === targetTrack.kind) {
+            const sameKindTracks = origin.tracks.filter((track) => track.kind === originTrack.kind);
+            const trackDelta = sameKindTracks.findIndex((track) => track.id === targetTrack.id) - sameKindTracks.findIndex((track) => track.id === originTrack.id);
+            for (const selected of drag.selected) {
+              const selectedClip = origin.clips.find((clip) => clip.id === selected.id);
+              const selectedTrack = origin.tracks.find((track) => track.id === selectedClip?.trackId);
+              if (!selectedClip || selectedTrack?.kind !== originTrack.kind) continue;
+              const sourceIndex = sameKindTracks.findIndex((track) => track.id === selectedTrack.id);
+              trackAssignments[selected.id] = sameKindTracks[sourceIndex + trackDelta]?.id ?? "__invalid-track-target__";
+            }
+          } else if (targetTrackId !== originClip.trackId) {
+            trackAssignments[originClip.id] = targetTrackId;
           }
-          return next;
+        }
+        const result = moveClips(origin, {
+          clipIds: drag.selected.map((item) => item.id),
+          deltaFrames: (previewClip?.start ?? originClip?.start ?? 0) - (originClip?.start ?? 0),
+          trackAssignments,
+          includeLinked: linkedSelection,
         });
-      }
-      setProject((current) => {
-        const next = cloneProject(current);
+        applyKernelResult(result, "Move edit applied", origin);
+      } else if (origin && preview && ["trim-start", "trim-end", "ripple-start", "ripple-end"].includes(drag.mode)) {
+        const previewClip = preview.clips.find((clip) => clip.id === drag.clipId);
+        const deltaFrames = drag.mode.endsWith("start")
+          ? drag.initialDuration - (previewClip?.duration ?? drag.initialDuration)
+          : (previewClip?.duration ?? drag.initialDuration) - drag.initialDuration;
+        const result = trimClip(origin, {
+          clipId: drag.clipId,
+          edge: drag.mode.endsWith("start") ? "start" : "end",
+          deltaFrames,
+          ripple: drag.mode.startsWith("ripple"),
+          includeLinked: linkedSelection,
+        });
+        applyKernelResult(result, `${drag.mode.replace(/-/g, " ")} edit applied`, origin);
+      } else if (origin && preview) {
+        const next = cloneProject(preview);
         pruneTransitions(next);
-        return next;
-      });
-      if (origin) setPast((items) => [...items.slice(-49), origin]);
-      setFuture([]);
-      setToast(`${drag.mode.replace(/-/g, " ")} edit applied`);
+        if (JSON.stringify(next) === JSON.stringify(origin)) setProject(origin);
+        else {
+          setProject(next);
+          setPast((items) => [...items.slice(-49), cloneProject(origin)]);
+          setFuture([]);
+          setToast(`${drag.mode.replace(/-/g, " ")} edit applied`);
+        }
+      }
       dragOriginProjectRef.current = null;
+      dragPreviewProjectRef.current = null;
       setDragTrackTarget(null);
       setDrag(null);
     };
+    const cancelDrag = () => {
+      const origin = dragOriginProjectRef.current;
+      if (origin) setProject(cloneProject(origin));
+      dragOriginProjectRef.current = null;
+      dragPreviewProjectRef.current = null;
+      setDragTrackTarget(null);
+      setDrag(null);
+      setToast("Edit cancelled");
+    };
     window.addEventListener("pointermove", onMove);
     window.addEventListener("pointerup", onUp, {once: true});
+    window.addEventListener("pointercancel", cancelDrag, {once: true});
+    window.addEventListener("lostpointercapture", cancelDrag, {once: true});
+    window.addEventListener("blur", cancelDrag, {once: true});
     return () => {
       window.removeEventListener("pointermove", onMove);
       window.removeEventListener("pointerup", onUp);
+      window.removeEventListener("pointercancel", cancelDrag);
+      window.removeEventListener("lostpointercapture", cancelDrag);
+      window.removeEventListener("blur", cancelDrag);
     };
-  }, [drag, frame, pixelsPerFrame, project.markers, project.tracks, snap]);
+  }, [applyKernelResult, drag, frame, linkedSelection, pixelsPerFrame, snap]);
 
   useEffect(() => {
     if (!marqueeActive) return;
@@ -1447,6 +1518,7 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
     const ids = selectedClipIds.includes(clip.id) ? expandLinkedIds(selectedClipIds) : expandLinkedIds([clip.id]);
     setSelectedClipIds(ids);
     dragOriginProjectRef.current = cloneProject(project);
+    dragPreviewProjectRef.current = cloneProject(project);
     setDrag({
       clipId: clip.id,
       mode,
@@ -1668,23 +1740,21 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
   const filesToMediaItems = async (files: File[], forcedBinId?: string) => Promise.all(files.map((file, index) => fileToMediaItem(file, index, forcedBinId)));
 
   const conformImportedFrameRate = async (items: ProjectMedia[]) => {
-    const mismatch = items.find((item) => item.kind === "video" && item.fps && !frameRatesMatch(item.fps, project.fps));
-    if (!mismatch?.fps) return items;
+    const currentProject = projectRef.current;
+    const mismatch = items.find((item) => item.kind === "video" && item.fps && !frameRatesMatch(item.fps, currentProject.fps));
+    if (!mismatch?.fps) return {items};
 
     const choice = await requestFrameRateChoice({
       mediaName: mismatch.name,
       mediaFps: mismatch.fps,
-      projectFps: project.fps,
+      projectFps: currentProject.fps,
       width: mismatch.width,
       height: mismatch.height,
     });
-    if (choice === "keep") return items;
+    if (choice === "keep") return {items};
 
     const nextFps = mismatch.fps;
-    const ratio = nextFps / project.fps;
-    commit((draft) => Object.assign(draft, retimeProjectForFrameRate(draft, nextFps)), `Sequence changed to ${formatFrameRate(nextFps)} fps`);
-    setFrame((current) => Math.max(0, Math.round(current * ratio)));
-    return items.map((item) => conformMediaToFrameRate(item, nextFps));
+    return {items: items.map((item) => conformMediaToFrameRate(item, nextFps)), targetFps: nextFps};
   };
 
   const uniqueImportFiles = (files: File[]) => {
@@ -1706,9 +1776,15 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
     const files = Array.from(event.target.files ?? []);
     event.target.value = "";
     const {unique, duplicates} = uniqueImportFiles(files);
-    const additions = await conformImportedFrameRate(await filesToMediaItems(unique));
+    const conformed = await conformImportedFrameRate(await filesToMediaItems(unique));
+    const additions = conformed.items;
     if (additions.length) {
-      commit((draft) => draft.media.unshift(...additions), `Imported ${additions.length} media ${additions.length === 1 ? "file" : "files"}`);
+      const previousFps = projectRef.current.fps;
+      commit((draft) => {
+        if (conformed.targetFps) Object.assign(draft, retimeProjectForFrameRate(draft, conformed.targetFps));
+        draft.media.unshift(...additions);
+      }, `Imported ${additions.length} media ${additions.length === 1 ? "file" : "files"}`);
+      if (conformed.targetFps) setFrame((current) => Math.max(0, Math.round(current * conformed.targetFps! / previousFps)));
       setSelectedMediaId(additions[0].id);
     }
     const unavailable = additions.filter((item) => item.renderReady === false).length;
@@ -1823,6 +1899,7 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
     event.preventDefault();
     event.stopPropagation();
     const start = getDropFrame(event);
+    const dropFps = project.fps;
     const track = project.tracks.find((candidate) => candidate.id === trackId);
     setDropTarget(null);
 
@@ -1834,20 +1911,35 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
     const files = Array.from(event.dataTransfer.files);
     if (!files.length) return;
     const {unique, duplicates} = uniqueImportFiles(files);
-    const additions = await conformImportedFrameRate(await filesToMediaItems(unique));
-    if (additions.length) commit((draft) => draft.media.unshift(...additions));
-    let cursor = start;
-    let added = 0;
-    for (const item of additions) {
-      const compatible = clipTrackKind(item.kind) === track.kind;
-      if (!compatible) continue;
-      if (addMediaAt(item, trackId, cursor, false)) {
-        cursor += item.duration;
-        added += 1;
-      }
+    const conformed = await conformImportedFrameRate(await filesToMediaItems(unique));
+    const additions = conformed.items;
+    const compatibleItems = additions.filter((item) => clipTrackKind(item.kind) === track.kind);
+    if (!compatibleItems.length) {
+      if (additions.length) commit((draft) => {
+        if (conformed.targetFps) Object.assign(draft, retimeProjectForFrameRate(draft, conformed.targetFps));
+        draft.media.unshift(...additions);
+      }, `Imported ${additions.length} media files`);
+      setToast(duplicates ? `Skipped ${duplicates} duplicate${duplicates === 1 ? "" : "s"}` : `Those files are not compatible with ${track.name}`);
+      return;
+    }
+    const latestProject = projectRef.current;
+    const staged = conformed.targetFps ? retimeProjectForFrameRate(latestProject, conformed.targetFps) : cloneProject(latestProject);
+    const placementFrame = Math.max(0, Math.round(start * staged.fps / dropFps));
+    staged.media.unshift(...additions);
+    let offsetFrames = 0;
+    const items = compatibleItems.map((item) => {
+      const placement = {mediaId: item.id, trackId, offsetFrames};
+      offsetFrames += item.duration;
+      return placement;
+    });
+    const result = placeMedia(staged, {mode: editMode, atFrame: placementFrame, items, idBase: "drop"});
+    const added = result.ok ? compatibleItems.length : 0;
+    if (applyKernelResult(result, `Dropped ${compatibleItems.length} ${compatibleItems.length === 1 ? "clip" : "clips"} onto ${track.name}`, latestProject) && result.ok) {
+      setSelectedClipIds(result.createdClipIds);
+      if (conformed.targetFps) setFrame((current) => Math.max(0, Math.round(current * conformed.targetFps! / latestProject.fps)));
     }
     const unavailable = additions.filter((item) => item.renderReady === false).length;
-    setToast(added ? `Dropped ${added} ${added === 1 ? "clip" : "clips"} onto ${track.name}${duplicates ? ` · skipped ${duplicates} duplicate${duplicates === 1 ? "" : "s"}` : ""}${unavailable ? " · preview only until relinked" : " · ready to export"}` : duplicates ? `Skipped ${duplicates} duplicate${duplicates === 1 ? "" : "s"}` : `Those files are not compatible with ${track.name}`);
+    if (result.ok) setToast(`Dropped ${added} ${added === 1 ? "clip" : "clips"} onto ${track.name}${duplicates ? ` · skipped ${duplicates} duplicate${duplicates === 1 ? "" : "s"}` : ""}${unavailable ? " · preview only until relinked" : " · ready to export"}`);
   };
 
   const exportIsActive = Boolean(renderJob && ["queued", "bundling", "rendering"].includes(renderJob.stage));
@@ -2349,6 +2441,8 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
               <button onClick={rippleDeleteSelected} title="Ripple delete selected (Shift+Delete)"><Trash2 size={15} /></button>
               <button className={snap ? "active" : ""} onClick={() => setSnap((value) => !value)} title="Snap to clips, markers, and playhead"><Magnet size={15} /></button>
               <button className={linkedSelection ? "active" : ""} onClick={() => setLinkedSelection((value) => !value)} title="Linked selection"><Link2 size={15} /></button>
+              <button className={editMode === "insert" ? "active" : ""} onClick={() => setEditMode("insert")} title="Insert edit: ripple targeted tracks">Insert</button>
+              <button className={editMode === "overwrite" ? "active" : ""} onClick={() => setEditMode("overwrite")} title="Overwrite edit: replace material in range">Overwrite</button>
             </div>
             <div className="sequence-title"><Layers3 size={14} /> Sequence 01 <span>{selectedClipIds.length ? `${selectedClipIds.length} selected` : `${project.width} × ${project.height} · ${formatFrameRate(project.fps)} fps`}</span></div>
             <div className="zoom-control"><ZoomOut size={14} /><input type="range" min="0.55" max="3.4" step="0.05" value={zoom} onChange={(event) => setZoom(Number(event.target.value))} /><ZoomIn size={14} /></div>
@@ -2357,6 +2451,7 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
             <div className="track-headers" style={{paddingTop: 28}}>
               {project.tracks.map((track) => (
                 <div className={`track-header ${track.kind}`} key={track.id}>
+                  <button aria-label={`Target ${track.name}`} className={trackTargets[track.kind] === track.id ? "track-target active" : "track-target"} onClick={() => setTrackTargets((current) => ({...current, [track.kind]: track.id}))} title={`Target ${track.name}`}>{trackTargets[track.kind] === track.id ? "●" : "○"}</button>
                   <strong>{track.name}</strong>
                   <button onClick={() => toggleTrack(track.id, "locked")}>{track.locked ? <Lock size={12} /> : <Unlock size={12} />}</button>
                   {track.kind !== "audio" ? <button onClick={() => toggleTrack(track.id, "hidden")}>{track.hidden ? <EyeOff size={13} /> : <Eye size={13} />}</button> : <><button className={track.solo ? "track-solo active" : "track-solo"} onClick={() => toggleTrack(track.id, "solo")} title={`Solo ${track.name}`}>S</button><button onClick={() => toggleTrack(track.id, "muted")} title={`Mute ${track.name}`}>{track.muted ? <VolumeX size={13} /> : <Volume2 size={13} />}</button></>}

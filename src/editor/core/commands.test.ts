@@ -1,8 +1,8 @@
 import {describe, expect, it} from "vitest";
 import {createBlankProject} from "../project-storage";
 import type {EditorClip, EditorProject} from "../types";
-import {DEFAULT_EFFECTS, DEFAULT_TRANSFORM} from "../types";
-import {executeTimelineCommand, retimeClip, rippleDelete, splitClip, type CommandResult, type CommandSuccess} from "./commands";
+import {DEFAULT_EFFECTS, DEFAULT_TITLE_STYLE, DEFAULT_TRANSFORM} from "../types";
+import {cloneClips, executeTimelineCommand, moveClips, placeMedia, retimeClip, rippleDelete, splitClip, trimClip, type CommandResult, type CommandSuccess} from "./commands";
 
 const clip = (updates: Partial<EditorClip> = {}): EditorClip => ({
   id: "video",
@@ -298,5 +298,166 @@ describe("timeline commands", () => {
       ok: false,
       error: {code: "INVALID_RESTORE"},
     });
+  });
+
+  it("moves linked clips atomically and round-trips through inverse", () => {
+    const value = project();
+    value.clips = [
+      clip({id: "video", linkedGroupId: "av"}),
+      clip({id: "audio", kind: "audio", trackId: "a1", linkedGroupId: "av"}),
+    ];
+    const result = successful(moveClips(value, {clipIds: ["video"], deltaFrames: 12}));
+    expect(result.project.clips.map((item) => [item.id, item.start])).toEqual([["video", 12], ["audio", 12]]);
+    expect(successful(executeTimelineCommand(result.project, result.inverse)).project).toEqual(value);
+  });
+
+  it("rejects locked, incompatible, negative, and colliding moves atomically", () => {
+    const value = project();
+    value.clips = [clip({id: "video"}), clip({id: "later", start: 30})];
+    expect(moveClips(value, {clipIds: ["video"], deltaFrames: -1})).toMatchObject({ok: false, error: {code: "INVALID_FRAME"}});
+    expect(moveClips(value, {clipIds: ["video"], deltaFrames: 0, trackAssignments: {video: "a1"}})).toMatchObject({ok: false, error: {code: "INCOMPATIBLE_TRACK"}});
+    expect(moveClips(value, {clipIds: ["later"], deltaFrames: -15})).toMatchObject({ok: false, error: {code: "INVALID_PROJECT", issues: [expect.objectContaining({code: "TRACK_OVERLAP"})]}});
+    const videoTrack = value.tracks.find((track) => track.id === "v1");
+    if (videoTrack) videoTrack.locked = true;
+    expect(moveClips(value, {clipIds: ["video"], deltaFrames: 1})).toMatchObject({ok: false, error: {code: "TRACK_LOCKED"}});
+  });
+
+  it("reports identity moves as no-ops without affected ids", () => {
+    const value = project();
+    value.clips = [clip({linkedGroupId: "av"}), clip({id: "audio", kind: "audio", trackId: "a1", linkedGroupId: "av"})];
+    const result = successful(moveClips(value, {clipIds: ["video"], deltaFrames: 0, includeLinked: false}));
+    expect(result.changed).toBe(false);
+    expect(result.affectedClipIds).toEqual([]);
+    expect(result.project.clips.map((item) => item.linkedGroupId)).toEqual(["av", "av"]);
+  });
+
+  it("trims linked starts with per-clip rates and rebases keyframes", () => {
+    const value = project();
+    value.clips = [
+      clip({id: "video", linkedGroupId: "av", playbackRate: 2, keyframes: [{id: "key", property: "transform.opacity", frame: 8, value: 50, easing: "linear"}]}),
+      clip({id: "audio", kind: "audio", trackId: "a1", linkedGroupId: "av", playbackRate: 0.5}),
+    ];
+    const result = successful(trimClip(value, {clipId: "video", edge: "start", deltaFrames: 4}));
+    expect(result.project.clips.find((item) => item.id === "video")).toMatchObject({start: 4, duration: 16, sourceStart: 12});
+    expect(result.project.clips.find((item) => item.id === "audio")).toMatchObject({start: 4, duration: 16, sourceStart: 6});
+    expect(result.project.clips.find((item) => item.id === "video")?.keyframes[0].frame).toBe(4);
+  });
+
+  it("unlinks an intentional partial trim and leaves no false sync group", () => {
+    const value = project();
+    value.clips = [clip({linkedGroupId: "av"}), clip({id: "audio", kind: "audio", trackId: "a1", linkedGroupId: "av"})];
+    const result = successful(trimClip(value, {clipId: "video", edge: "start", deltaFrames: 2, includeLinked: false}));
+    expect(result.project.clips.find((item) => item.id === "video")?.linkedGroupId).toBeUndefined();
+    expect(result.project.clips.find((item) => item.id === "audio")?.linkedGroupId).toBe("av");
+  });
+
+  it("ripple trims downstream linked media and rejects locked propagation", () => {
+    const value = project();
+    value.clips = [
+      clip({id: "video", linkedGroupId: "av"}),
+      clip({id: "audio", kind: "audio", trackId: "a1", linkedGroupId: "av"}),
+      clip({id: "later-video", start: 20, linkedGroupId: "later"}),
+      clip({id: "later-audio", kind: "audio", trackId: "a1", start: 20, linkedGroupId: "later"}),
+    ];
+    const result = successful(trimClip(value, {clipId: "video", edge: "end", deltaFrames: 5, ripple: true}));
+    expect(result.project.clips.find((item) => item.id === "video")?.duration).toBe(25);
+    expect(result.project.clips.find((item) => item.id === "later-video")?.start).toBe(25);
+    expect(result.project.clips.find((item) => item.id === "later-audio")?.start).toBe(25);
+    const locked = project();
+    locked.clips = value.clips;
+    const audioTrack = locked.tracks.find((track) => track.id === "a1");
+    if (audioTrack) audioTrack.locked = true;
+    expect(trimClip(locked, {clipId: "video", edge: "end", deltaFrames: 5, ripple: true})).toMatchObject({ok: false, error: {code: "TRACK_LOCKED"}});
+  });
+
+  it("clones clips deterministically while preserving internal links and transitions", () => {
+    const value = project();
+    const payload = [
+      clip({id: "video", linkedGroupId: "av"}),
+      clip({id: "audio", kind: "audio", trackId: "a1", linkedGroupId: "av"}),
+      clip({id: "next", start: 20}),
+    ];
+    const transitions = [{id: "edit", fromClipId: "video", toClipId: "next", type: "cross-dissolve" as const, duration: 4}];
+    const first = successful(cloneClips(value, {clips: payload, transitions, atFrame: 100, idBase: "paste"}));
+    expect(first.createdClipIds).toEqual(["paste-video", "paste-audio", "paste-next"]);
+    expect(first.project.clips.find((item) => item.id === "paste-video")?.linkedGroupId).toBe("paste-link-av");
+    expect(first.project.clips.find((item) => item.id === "paste-audio")?.linkedGroupId).toBe("paste-link-av");
+    expect(first.project.transitions).toEqual([expect.objectContaining({id: "paste-edit", fromClipId: "paste-video", toClipId: "paste-next"})]);
+    const second = successful(cloneClips(first.project, {clips: payload, transitions, atFrame: 160, idBase: "paste"}));
+    expect(second.createdClipIds).toEqual(["paste-video-2", "paste-audio-2", "paste-next-2"]);
+  });
+
+  it("inserts media and ripples destination content", () => {
+    const value = project();
+    value.media = [{id: "media", name: "Media", kind: "video", src: "/media.mp4", duration: 10, color: "#09f", binId: "bin-video"}];
+    value.clips = [clip({id: "later", start: 20, duration: 10})];
+    const result = successful(placeMedia(value, {mode: "insert", atFrame: 20, items: [{mediaId: "media", trackId: "v1"}], idBase: "insert"}));
+    expect(result.project.clips.find((item) => item.id === "later")?.start).toBe(30);
+    expect(result.project.clips.find((item) => item.id === "insert-media-1")).toMatchObject({start: 20, duration: 10, sourceMediaId: "media"});
+  });
+
+  it("overwrite placement resolves spanning and right-edge intersections", () => {
+    const spanning = project();
+    spanning.media = [{id: "media", name: "Media", kind: "video", src: "/media.mp4", duration: 10, color: "#09f", binId: "bin-video"}];
+    spanning.clips = [clip({id: "long", duration: 40, keyframes: [{id: "right-key", property: "transform.opacity", frame: 25, value: 50, easing: "linear"}]})];
+    const split = successful(placeMedia(spanning, {mode: "overwrite", atFrame: 10, items: [{mediaId: "media", trackId: "v1"}], idBase: "overwrite"}));
+    expect(split.project.clips.find((item) => item.id === "long")).toMatchObject({start: 0, duration: 10});
+    expect(split.project.clips.find((item) => item.id === "overwrite-long-overwrite-right")).toMatchObject({start: 20, duration: 20, sourceStart: 24});
+    expect(split.project.clips.find((item) => item.id === "overwrite-long-overwrite-right")?.keyframes[0].frame).toBe(5);
+
+    const rightEdge = project();
+    rightEdge.media = spanning.media;
+    rightEdge.clips = [clip({id: "right", start: 15, duration: 20})];
+    const trimmed = successful(placeMedia(rightEdge, {mode: "overwrite", atFrame: 10, items: [{mediaId: "media", trackId: "v1"}], idBase: "overwrite"}));
+    expect(trimmed.project.clips.find((item) => item.id === "right")).toMatchObject({start: 20, duration: 15, sourceStart: 9});
+  });
+
+  it("fails closed for insert straddlers and partial linked overwrites", () => {
+    const value = project();
+    value.media = [{id: "media", name: "Media", kind: "video", src: "/media.mp4", duration: 10, color: "#09f", binId: "bin-video"}];
+    value.clips = [clip({id: "straddler", start: 5, duration: 20})];
+    expect(placeMedia(value, {mode: "insert", atFrame: 10, items: [{mediaId: "media", trackId: "v1"}], idBase: "insert"})).toMatchObject({ok: false, error: {code: "PLACEMENT_CONFLICT"}});
+
+    const linked = project();
+    linked.media = value.media;
+    linked.clips = [
+      clip({id: "video", linkedGroupId: "av"}),
+      clip({id: "audio", kind: "audio", trackId: "a1", linkedGroupId: "av"}),
+    ];
+    expect(placeMedia(linked, {mode: "overwrite", atFrame: 5, items: [{mediaId: "media", trackId: "v1"}], idBase: "overwrite"})).toMatchObject({ok: false, error: {code: "LINKED_OPERATION_CONFLICT"}});
+  });
+
+  it("preserves a new linked group for right survivors of a linked overwrite split", () => {
+    const value = project();
+    value.media = [
+      {id: "video-media", name: "Video", kind: "video", src: "/video.mp4", duration: 5, color: "#09f", binId: "bin-video"},
+      {id: "audio-media", name: "Audio", kind: "audio", src: "/audio.wav", duration: 5, color: "#0f9", binId: "bin-audio"},
+    ];
+    value.clips = [clip({id: "video", linkedGroupId: "av"}), clip({id: "audio", kind: "audio", trackId: "a1", linkedGroupId: "av"})];
+    const result = successful(placeMedia(value, {
+      mode: "overwrite",
+      atFrame: 5,
+      items: [{mediaId: "video-media", trackId: "v1"}, {mediaId: "audio-media", trackId: "a1"}],
+      idBase: "overwrite",
+    }));
+    const videoRight = result.project.clips.find((item) => item.id === "overwrite-video-overwrite-right");
+    const audioRight = result.project.clips.find((item) => item.id === "overwrite-audio-overwrite-right");
+    expect(videoRight?.linkedGroupId).toBe("overwrite-av-overwrite-right");
+    expect(audioRight?.linkedGroupId).toBe("overwrite-av-overwrite-right");
+  });
+
+  it("fails closed for malformed or unsupported command payloads", () => {
+    const value = project();
+    expect(executeTimelineCommand(value, {type: "move-clips", clipIds: null, deltaFrames: 1} as never)).toMatchObject({ok: false, error: {code: "INVALID_COMMAND"}});
+    expect(executeTimelineCommand(value, {type: "trim-clip", clipId: "video", edge: "bogus", deltaFrames: 1} as never)).toMatchObject({ok: false, error: {code: "INVALID_COMMAND"}});
+    expect(executeTimelineCommand(value, {type: "unknown"} as never)).toMatchObject({ok: false, error: {code: "INVALID_COMMAND"}});
+    const malformedClip = {...clip()} as unknown as {keyframes?: EditorClip["keyframes"]};
+    delete malformedClip.keyframes;
+    expect(executeTimelineCommand(value, {type: "clone-clips", clips: [malformedClip], atFrame: 0, idBase: "x"} as never)).toMatchObject({ok: false, error: {code: "INVALID_COMMAND"}});
+    expect(executeTimelineCommand(value, {type: "place-media", mode: "overwrite", atFrame: 0, idBase: "x", items: [{mediaId: "m", trackId: "v1", duration: "10"}]} as never)).toMatchObject({ok: false, error: {code: "INVALID_COMMAND"}});
+    expect(executeTimelineCommand(value, {type: "clone-clips", clips: [{...clip(), playbackRate: "2"}], atFrame: 0, idBase: "x"} as never)).toMatchObject({ok: false, error: {code: "INVALID_COMMAND"}});
+    const cyclicStyle = {...DEFAULT_TITLE_STYLE} as typeof DEFAULT_TITLE_STYLE & {self?: unknown};
+    cyclicStyle.self = cyclicStyle;
+    expect(executeTimelineCommand(value, {type: "clone-clips", clips: [{...clip({kind: "title"}), textStyle: cyclicStyle}], atFrame: 0, idBase: "x"} as never)).toMatchObject({ok: false, error: {code: "INVALID_COMMAND"}});
   });
 });
