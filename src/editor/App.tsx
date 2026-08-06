@@ -2452,7 +2452,7 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
           </div>
           <div className="timeline-body">
             <div className="track-headers">
-              <div className="track-routing-header"><span>Destination</span><i>Incoming media route</i></div>
+              <div className="track-routing-header" title="Incoming media destination"><span>Destination</span></div>
               {project.tracks.map((track) => (
                 <div className={`track-header ${track.kind} ${track.locked ? "locked" : ""}`} key={track.id}>
                   <button aria-label={`Route incoming ${track.kind} media to ${track.name}`} aria-pressed={destinationRoutes[track.kind] === track.id} className={destinationRoutes[track.kind] === track.id ? "destination-route active" : "destination-route"} onClick={() => setDestinationRoutes((current) => ({...current, [track.kind]: track.id}))} title={track.locked ? `${track.name} is locked · unlock to use as a destination` : `Route incoming ${track.kind} media to ${track.name}`}>{track.name}</button>

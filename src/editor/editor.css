@@ -551,7 +551,7 @@ button { color: inherit; }
 .tool-group button:hover, .tool-group button.active { color: #b8a7ff; background: #211b32; }
 .tool-divider { width: 1px; height: 16px; margin: 0 4px; background: #2b2e36; }
 .edit-mode-switch { height: 25px; padding: 2px; display: flex; border: 1px solid #2b2e36; border-radius: 5px; background: #0c0e12; }
-.tool-group .edit-mode-switch button { width: auto; min-width: 48px; height: 19px; padding: 0 7px; border-radius: 3px; color: #646a76; font-size: 8px; font-weight: 650; letter-spacing: .01em; }
+.tool-group .edit-mode-switch button { width: auto; min-width: 48px; height: 19px; padding: 0 7px; border-radius: 3px; color: #858c98; font-size: 8px; font-weight: 650; letter-spacing: .01em; }
 .tool-group .edit-mode-switch button:last-child { min-width: 63px; }
 .tool-group .edit-mode-switch button:hover { color: #c1c5ce; background: #181b21; }
 .tool-group .edit-mode-switch button.active { color: #eee9ff; background: #493476; box-shadow: inset 0 0 0 1px rgba(190,169,255,.18); }
@@ -563,16 +563,15 @@ button { color: inherit; }
 .zoom-control input { margin: 0; }
 .timeline-body { min-height: 0; display: grid; grid-template-columns: 132px minmax(0,1fr); }
 .track-headers { z-index: 4; border-right: 1px solid #292c34; background: #111318; box-shadow: 7px 0 15px rgba(0,0,0,.14); }
-.track-routing-header { height: 28px; padding: 0 6px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid #24272e; color: #7d8490; background: #0e1014; }
-.track-routing-header span { font-size: 7px; font-weight: 750; letter-spacing: .08em; text-transform: uppercase; }
-.track-routing-header i { color: #4f5560; font-size: 6px; font-style: normal; }
+.track-routing-header { height: 28px; padding: 0 6px; display: flex; align-items: center; border-bottom: 1px solid #24272e; color: #8b929e; background: #0e1014; }
+.track-routing-header span { font-size: 8px; font-weight: 750; letter-spacing: .08em; text-transform: uppercase; }
 .track-header { height: 46px; display: grid; grid-template-columns: 34px minmax(0,1fr) 20px 20px; align-items: center; gap: 2px; padding: 0 6px; border-bottom: 1px solid #24272e; color: #68707c; }
 .track-header.audio { background: #101613; }
 .track-header.caption { background: #101619; box-shadow: inset 3px 0 #2d7f88; }
 .track-header.audio { grid-template-columns: 34px minmax(0,1fr) 20px 20px 20px; }
 .track-header button { width: 20px; height: 22px; padding: 0; display: grid; place-items: center; border: 0; background: transparent; color: #5f6570; cursor: pointer; }
 .track-header button:hover { color: #c5c8d0; }
-.track-header .destination-route { width: 32px; height: 22px; border: 1px solid #3a3f49; border-radius: 3px; color: #7b828e; background: #0b0d11; font-size: 8px; font-weight: 750; font-variant-numeric: tabular-nums; }
+.track-header .destination-route { width: 32px; height: 22px; border: 1px solid #454b56; border-radius: 3px; color: #858c98; background: #0b0d11; font-size: 8px; font-weight: 750; font-variant-numeric: tabular-nums; }
 .track-header .destination-route:hover { border-color: #7561a7; color: #c5b7ee; background: #171321; }
 .track-header .destination-route.active { border-color: #9b7cff; color: #f1ecff; background: #493477; box-shadow: inset 0 0 0 1px rgba(217,203,255,.16), 0 0 10px rgba(118,78,229,.16); }
 .track-header.caption .destination-route.active { border-color: #57b6c0; color: #e3fcff; background: #24555c; box-shadow: inset 0 0 0 1px rgba(174,242,248,.14), 0 0 10px rgba(55,175,187,.14); }
