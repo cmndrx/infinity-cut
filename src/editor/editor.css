@@ -546,9 +546,15 @@ button { color: inherit; }
 .plain-slider-property input::-webkit-slider-thumb { width: 9px; height: 9px; appearance: none; border: 2px solid #ae99ff; border-radius: 50%; background: #201a31; cursor: ew-resize; }
 
 .timeline-toolbar { display: grid; grid-template-columns: 1fr auto 1fr; align-items: center; padding: 0 9px; border-bottom: 1px solid var(--line); background: #111318; }
-.tool-group { display: flex; gap: 2px; }
+.tool-group { min-width: 0; display: flex; align-items: center; gap: 2px; }
 .tool-group button { width: 25px; height: 25px; border: 0; border-radius: 4px; display: grid; place-items: center; background: transparent; color: #747a86; cursor: pointer; }
 .tool-group button:hover, .tool-group button.active { color: #b8a7ff; background: #211b32; }
+.tool-divider { width: 1px; height: 16px; margin: 0 4px; background: #2b2e36; }
+.edit-mode-switch { height: 25px; padding: 2px; display: flex; border: 1px solid #2b2e36; border-radius: 5px; background: #0c0e12; }
+.tool-group .edit-mode-switch button { width: auto; min-width: 48px; height: 19px; padding: 0 7px; border-radius: 3px; color: #646a76; font-size: 8px; font-weight: 650; letter-spacing: .01em; }
+.tool-group .edit-mode-switch button:last-child { min-width: 63px; }
+.tool-group .edit-mode-switch button:hover { color: #c1c5ce; background: #181b21; }
+.tool-group .edit-mode-switch button.active { color: #eee9ff; background: #493476; box-shadow: inset 0 0 0 1px rgba(190,169,255,.18); }
 .tool-letter { font-family: "Space Grotesk", sans-serif; font-size: 10px; font-weight: 700; }
 .sequence-title { display: flex; align-items: center; gap: 5px; color: #a5a9b2; font-size: 9px; font-weight: 600; }
 .sequence-title svg { color: var(--purple); }

@@ -2441,8 +2441,11 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
               <button onClick={rippleDeleteSelected} title="Ripple delete selected (Shift+Delete)"><Trash2 size={15} /></button>
               <button className={snap ? "active" : ""} onClick={() => setSnap((value) => !value)} title="Snap to clips, markers, and playhead"><Magnet size={15} /></button>
               <button className={linkedSelection ? "active" : ""} onClick={() => setLinkedSelection((value) => !value)} title="Linked selection"><Link2 size={15} /></button>
-              <button className={editMode === "insert" ? "active" : ""} onClick={() => setEditMode("insert")} title="Insert edit: ripple targeted tracks">Insert</button>
-              <button className={editMode === "overwrite" ? "active" : ""} onClick={() => setEditMode("overwrite")} title="Overwrite edit: replace material in range">Overwrite</button>
+              <span className="tool-divider" aria-hidden="true" />
+              <div className="edit-mode-switch" role="group" aria-label="Timeline edit mode">
+                <button aria-pressed={editMode === "insert"} className={editMode === "insert" ? "active" : ""} onClick={() => setEditMode("insert")} title="Insert edit: ripple targeted tracks">Insert</button>
+                <button aria-pressed={editMode === "overwrite"} className={editMode === "overwrite" ? "active" : ""} onClick={() => setEditMode("overwrite")} title="Overwrite edit: replace material in range">Overwrite</button>
+              </div>
             </div>
             <div className="sequence-title"><Layers3 size={14} /> Sequence 01 <span>{selectedClipIds.length ? `${selectedClipIds.length} selected` : `${project.width} × ${project.height} · ${formatFrameRate(project.fps)} fps`}</span></div>
             <div className="zoom-control"><ZoomOut size={14} /><input type="range" min="0.55" max="3.4" step="0.05" value={zoom} onChange={(event) => setZoom(Number(event.target.value))} /><ZoomIn size={14} /></div>
