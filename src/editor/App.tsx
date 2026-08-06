@@ -2495,10 +2495,10 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
                     >
                       {dropTarget?.trackId === track.id && (
                         <div
-                          className={`drop-preview ${dropTarget.allowed ? "allowed" : "rejected"}`}
+                          className={`drop-preview ${dropTarget.allowed ? `allowed ${editMode}` : "rejected"}`}
                           style={{left: dropTarget.frame * pixelsPerFrame, width: Math.max(60, dropTarget.duration * pixelsPerFrame)}}
                         >
-                          {dropTarget.allowed ? <><Plus size={12} /> Drop to add</> : <><Lock size={12} /> Cannot drop here</>}
+                          {dropTarget.allowed ? <><Plus size={12} /><span>{editMode === "insert" ? "INSERT" : "OVERWRITE"} · {track.name}</span></> : <><Lock size={12} /><span>{track.name} unavailable</span></>}
                         </div>
                       )}
                       {project.clips.filter((clip) => clip.trackId === track.id).map((clip) => (
