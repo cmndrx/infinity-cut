@@ -276,7 +276,7 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
   const [activeTool, setActiveTool] = useState<TimelineTool>("select");
   const [linkedSelection, setLinkedSelection] = useState(true);
   const [editMode, setEditMode] = useState<EditMode>("overwrite");
-  const [trackTargets, setTrackTargets] = useState<Record<EditorTrack["kind"], string>>(() => ({
+  const [destinationRoutes, setDestinationRoutes] = useState<Record<EditorTrack["kind"], string>>(() => ({
     video: initialProject.tracks.find((track) => track.id === "v2")?.id ?? initialProject.tracks.find((track) => track.kind === "video")?.id ?? "",
     audio: initialProject.tracks.find((track) => track.id === "a1")?.id ?? initialProject.tracks.find((track) => track.kind === "audio")?.id ?? "",
     caption: initialProject.tracks.find((track) => track.kind === "caption")?.id ?? "",
@@ -357,7 +357,7 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
   }, [projectId]);
 
   useEffect(() => {
-    setTrackTargets((current) => {
+    setDestinationRoutes((current) => {
       const next = {...current};
       let changed = false;
       for (const kind of ["video", "audio", "caption"] as const) {
@@ -647,7 +647,7 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
       const kindTracks = project.tracks.filter((track) => track.kind === kind);
       const sourceTrackIds = Array.from(new Set(clips.map((clip) => clip.trackId).filter((trackId) => kindTracks.some((track) => track.id === trackId))));
       if (!sourceTrackIds.length) continue;
-      const targetIndex = kindTracks.findIndex((track) => track.id === trackTargets[kind]);
+      const targetIndex = kindTracks.findIndex((track) => track.id === destinationRoutes[kind]);
       const anchorIndex = Math.min(...sourceTrackIds.map((trackId) => kindTracks.findIndex((track) => track.id === trackId)));
       for (const sourceTrackId of sourceTrackIds) {
         const relativeIndex = kindTracks.findIndex((track) => track.id === sourceTrackId) - anchorIndex;
@@ -656,7 +656,7 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
     }
     const result = cloneClips(project, {clips, transitions, atFrame: frame, trackMap, idBase: "paste"});
     if (applyKernelResult(result, `Pasted ${clips.length} ${clips.length === 1 ? "clip" : "clips"}`) && result.ok) setSelectedClipIds(result.createdClipIds);
-  }, [applyKernelResult, frame, project, trackTargets]);
+  }, [applyKernelResult, destinationRoutes, frame, project]);
 
   const linkSelectedClips = useCallback(() => {
     if (selectedClipIds.length < 2) {
@@ -738,9 +738,9 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
 
   const addMediaToTimeline = useCallback((item: MediaItem) => {
     const kind = clipTrackKind(item.kind);
-    const targetTrack = trackTargets[kind] || project.tracks.find((track) => track.kind === kind && !track.locked)?.id || "";
+    const targetTrack = destinationRoutes[kind] || project.tracks.find((track) => track.kind === kind && !track.locked)?.id || "";
     addMediaAt(item, targetTrack, frame);
-  }, [addMediaAt, frame, project.tracks, trackTargets]);
+  }, [addMediaAt, destinationRoutes, frame, project.tracks]);
 
   const addTextClip = useCallback((kind: "title" | "caption") => {
     const targetTrack = kind === "caption" ? project.tracks.find((track) => track.kind === "caption") : project.tracks.find((track) => track.id === "v3") ?? project.tracks.find((track) => track.kind === "video");
@@ -2451,11 +2451,12 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
             <div className="zoom-control"><ZoomOut size={14} /><input type="range" min="0.55" max="3.4" step="0.05" value={zoom} onChange={(event) => setZoom(Number(event.target.value))} /><ZoomIn size={14} /></div>
           </div>
           <div className="timeline-body">
-            <div className="track-headers" style={{paddingTop: 28}}>
+            <div className="track-headers">
+              <div className="track-routing-header"><span>Destination</span><i>Incoming media route</i></div>
               {project.tracks.map((track) => (
-                <div className={`track-header ${track.kind}`} key={track.id}>
-                  <button aria-label={`Target ${track.name}`} className={trackTargets[track.kind] === track.id ? "track-target active" : "track-target"} onClick={() => setTrackTargets((current) => ({...current, [track.kind]: track.id}))} title={`Target ${track.name}`}>{trackTargets[track.kind] === track.id ? "●" : "○"}</button>
-                  <strong>{track.name}</strong>
+                <div className={`track-header ${track.kind} ${track.locked ? "locked" : ""}`} key={track.id}>
+                  <button aria-label={`Route incoming ${track.kind} media to ${track.name}`} aria-pressed={destinationRoutes[track.kind] === track.id} className={destinationRoutes[track.kind] === track.id ? "destination-route active" : "destination-route"} onClick={() => setDestinationRoutes((current) => ({...current, [track.kind]: track.id}))} title={track.locked ? `${track.name} is locked · unlock to use as a destination` : `Route incoming ${track.kind} media to ${track.name}`}>{track.name}</button>
+                  <span aria-hidden="true" />
                   <button onClick={() => toggleTrack(track.id, "locked")}>{track.locked ? <Lock size={12} /> : <Unlock size={12} />}</button>
                   {track.kind !== "audio" ? <button onClick={() => toggleTrack(track.id, "hidden")}>{track.hidden ? <EyeOff size={13} /> : <Eye size={13} />}</button> : <><button className={track.solo ? "track-solo active" : "track-solo"} onClick={() => toggleTrack(track.id, "solo")} title={`Solo ${track.name}`}>S</button><button onClick={() => toggleTrack(track.id, "muted")} title={`Mute ${track.name}`}>{track.muted ? <VolumeX size={13} /> : <Volume2 size={13} />}</button></>}
                 </div>
