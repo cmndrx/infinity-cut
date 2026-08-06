@@ -66,7 +66,8 @@ import {
 } from "lucide-react";
 import {EditorComposition} from "./EditorComposition";
 import {getAnimatedPropertyValue, hasKeyframeAt, hasPropertyKeyframes} from "./animation";
-import {applyClipSpeed, getClipPlaybackRate, getClipSourceSpan, MAX_PLAYBACK_RATE, MIN_PLAYBACK_RATE, playbackRateForDuration} from "./clip-speed";
+import {getClipPlaybackRate, getClipSourceSpan, MAX_PLAYBACK_RATE, MIN_PLAYBACK_RATE, playbackRateForDuration} from "./clip-speed";
+import {retimeClip, rippleDelete, splitClip} from "./core";
 import {conformMediaToFrameRate, formatFrameRate, frameRatesMatch, normalizeFrameRate, retimeProjectForFrameRate} from "./frame-rate";
 import {createProjectFile, normalizeProject, saveStoredProject} from "./project-storage";
 import type {EditorClip, EditorProject, EditorTrack, EditorTransition, KeyframeProperty, MediaKind, ProjectMedia, TextStyle, TransitionType} from "./types";
@@ -405,10 +406,23 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
   const applySpeedDialog = () => {
     if (!speedDialog) return;
     const playbackRate = clamp(speedDialog.speedPercent / 100, MIN_PLAYBACK_RATE, MAX_PLAYBACK_RATE);
-    commit((draft) => Object.assign(draft, applyClipSpeed(draft, speedDialog.clipId, playbackRate, {
+    const result = retimeClip(project, {
+      clipId: speedDialog.clipId,
+      playbackRate,
       ripple: speedDialog.ripple,
       preservePitch: speedDialog.preservePitch,
-    })), `Changed clip speed to ${Math.round(playbackRate * 1000) / 10}%`);
+      includeLinked: linkedSelection,
+    });
+    if (!result.ok) {
+      setToast(result.error.message);
+      return;
+    }
+    if (!result.changed) {
+      setSpeedDialog(null);
+      setToast("Clip speed is already set to that value");
+      return;
+    }
+    commit((draft) => Object.assign(draft, result.project), `Changed clip speed to ${Math.round(playbackRate * 1000) / 10}%`);
     setSpeedDialog(null);
   };
 
@@ -537,50 +551,26 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
   }, [commit, expandLinkedIds, project.clips, project.tracks, selectedClipIds]);
 
   const rippleDeleteSelected = useCallback(() => {
-    const ids = expandLinkedIds(selectedClipIds);
-    const selected = project.clips.filter((clip) => ids.includes(clip.id));
-    if (!selected.length) return;
-    const ranges = new Map<string, {start: number; end: number}>();
-    for (const clip of selected) {
-      const track = project.tracks.find((candidate) => candidate.id === clip.trackId);
-      if (track?.locked) continue;
-      const range = ranges.get(clip.trackId);
-      ranges.set(clip.trackId, {start: Math.min(range?.start ?? clip.start, clip.start), end: Math.max(range?.end ?? clip.start + clip.duration, clip.start + clip.duration)});
+    if (!selectedClipIds.length) return;
+    const result = rippleDelete(project, selectedClipIds, linkedSelection);
+    if (!result.ok) {
+      setToast(result.error.message);
+      return;
     }
-    commit((draft) => {
-      draft.clips = draft.clips.filter((clip) => !ids.includes(clip.id));
-      draft.transitions = draft.transitions.filter((transition) => !ids.includes(transition.fromClipId) && !ids.includes(transition.toClipId));
-      for (const clip of draft.clips) {
-        const range = ranges.get(clip.trackId);
-        if (range && clip.start >= range.end) clip.start -= range.end - range.start;
-      }
-    }, `Ripple deleted ${selected.length} ${selected.length === 1 ? "clip" : "clips"}`);
+    const removedCount = result.removedClipIds.length;
+    commit((draft) => Object.assign(draft, result.project), `Ripple deleted ${removedCount} ${removedCount === 1 ? "clip" : "clips"}`);
     setSelectedClipIds([]);
-  }, [commit, expandLinkedIds, project.clips, project.tracks, selectedClipIds]);
+  }, [commit, linkedSelection, project, selectedClipIds]);
 
   const splitClipAt = useCallback((clipId: string, splitFrame: number) => {
     const clip = project.clips.find((candidate) => candidate.id === clipId);
-    const track = project.tracks.find((candidate) => candidate.id === clip?.trackId);
-    if (!clip || track?.locked || splitFrame <= clip.start + 1 || splitFrame >= clip.start + clip.duration - 1) return null;
-    const splitOffset = splitFrame - clip.start;
-    const newId = `${clip.id}-split-${Date.now()}-${clipIdCounterRef.current++}`;
-    commit((draft) => {
-      const original = draft.clips.find((candidate) => candidate.id === clip.id);
-      if (!original) return;
-      draft.transitions = draft.transitions.filter((transition) => transition.fromClipId !== original.id);
-      const rightFadeOut = original.fadeOut;
-      const rightKeyframes = (original.keyframes ?? [])
-        .filter((keyframe) => keyframe.frame >= splitOffset)
-        .map((keyframe) => ({...keyframe, id: `${keyframe.id}-split-${clipIdCounterRef.current++}`, frame: keyframe.frame - splitOffset}));
-      original.keyframes = (original.keyframes ?? []).filter((keyframe) => keyframe.frame < splitOffset);
-      original.duration = splitOffset;
-      original.fadeIn = Math.min(original.fadeIn, original.duration);
-      original.fadeOut = 0;
-      draft.clips.push({...cloneClip(original), id: newId, name: `${original.name} B`, start: splitFrame, duration: clip.duration - splitOffset, sourceStart: clip.sourceStart + splitOffset * getClipPlaybackRate(clip), fadeIn: 0, fadeOut: Math.min(rightFadeOut, clip.duration - splitOffset), keyframes: rightKeyframes});
-    }, `Split ${clip.name} at ${formatTimecode(splitFrame, project.fps)}`);
-    setSelectedClipIds([newId]);
-    return newId;
-  }, [commit, project.clips, project.fps, project.tracks]);
+    if (!clip) return null;
+    const result = splitClip(project, clipId, splitFrame, linkedSelection);
+    if (!result.ok) return null;
+    commit((draft) => Object.assign(draft, result.project), `Split ${clip.name} at ${formatTimecode(splitFrame, project.fps)}`);
+    setSelectedClipIds(result.createdClipIds);
+    return result.project.clips.find((candidate) => result.createdClipIds.includes(candidate.id) && candidate.trackId === clip.trackId)?.id ?? result.createdClipIds[0] ?? null;
+  }, [commit, linkedSelection, project]);
 
   const splitSelected = useCallback(() => {
     if (!selectedClipId || !splitClipAt(selectedClipId, frame)) {
