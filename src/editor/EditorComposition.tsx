@@ -2,7 +2,7 @@ import React from "react";
 import {AbsoluteFill, Html5Audio, Img, OffthreadVideo, Sequence, staticFile, useCurrentFrame} from "remotion";
 import {getAnimatedPropertyValue} from "./animation";
 import {getClipPlaybackRate} from "./clip-speed";
-import type {EditorClip, EditorProject, EditorTransition} from "./types";
+import type {ColorCurvePoint, EditorClip, EditorEffectMask, EditorProject, EditorTransition, MaskProperty} from "./types";
 import {DEFAULT_CAPTION_STYLE, DEFAULT_TITLE_STYLE} from "./types";
 import {projectViewForSequence} from "./sequences";
 
@@ -12,7 +12,7 @@ export type EditorCompositionProps = {
 
 const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value));
 
-const visualStyle = (clip: EditorClip, localFrame: number, processed = true): React.CSSProperties => {
+const visualStyle = (clip: EditorClip, localFrame: number, processed = true, gradeFilterId?: string): React.CSSProperties => {
   const x = getAnimatedPropertyValue(clip, "transform.x", localFrame);
   const y = getAnimatedPropertyValue(clip, "transform.y", localFrame);
   const scale = getAnimatedPropertyValue(clip, "transform.scale", localFrame);
@@ -44,16 +44,82 @@ const visualStyle = (clip: EditorClip, localFrame: number, processed = true): Re
     height: "100%",
     opacity: opacity / 100,
     transform: `translate(${x}px, ${y}px) scale(${scale / 100}) rotate(${rotation}deg)`,
-    filter: `brightness(${tonalBrightness}%) contrast(${tonalContrast}%) saturate(${tonalSaturation}%) hue-rotate(${hue}deg) blur(${blur}px)${glow > 0 ? ` drop-shadow(0 0 ${glow * .22}px rgba(255,255,255,${glow / 260}))` : ""}`,
+    filter: `${gradeFilterId ? `url(#${gradeFilterId}) ` : ""}brightness(${tonalBrightness}%) contrast(${tonalContrast}%) saturate(${tonalSaturation}%) hue-rotate(${hue}deg) blur(${blur}px)${glow > 0 ? ` drop-shadow(0 0 ${glow * .22}px rgba(255,255,255,${glow / 260}))` : ""}`,
   };
 };
 
-const effectMaskStyle = (clip: EditorClip): React.CSSProperties => {
+const interpolateMaskProperty = (mask: EditorEffectMask, property: MaskProperty, frame: number) => {
+  const keyframes = mask.keyframes.filter((item) => item.property === property).sort((left, right) => left.frame - right.frame);
+  if (!keyframes.length) return mask[property];
+  if (frame <= keyframes[0].frame) return keyframes[0].value;
+  if (frame >= keyframes[keyframes.length - 1].frame) return keyframes[keyframes.length - 1].value;
+  const rightIndex = keyframes.findIndex((item) => item.frame >= frame);
+  const left = keyframes[rightIndex - 1];
+  const right = keyframes[rightIndex];
+  const progress = (frame - left.frame) / Math.max(1, right.frame - left.frame);
+  const eased = right.easing === "ease-in-out" ? progress * progress * (3 - 2 * progress) : progress;
+  return left.value + (right.value - left.value) * eased;
+};
+
+const maskGradient = (mask: EditorEffectMask, localFrame: number) => {
+  const x = interpolateMaskProperty(mask, "x", localFrame);
+  const y = interpolateMaskProperty(mask, "y", localFrame);
+  const width = interpolateMaskProperty(mask, "width", localFrame);
+  const height = interpolateMaskProperty(mask, "height", localFrame);
+  const feather = clamp(interpolateMaskProperty(mask, "feather", localFrame), 0, 100);
+  const solid = clamp(100 - feather, 0, 100);
+  const shape = mask.shape === "rectangle" ? "ellipse" : "ellipse";
+  const core = `${shape} ${Math.max(1, width / 2)}% ${Math.max(1, height / 2)}% at ${x}% ${y}%`;
+  return mask.inverted
+    ? `radial-gradient(${core}, transparent 0%, transparent ${solid}%, rgba(0,0,0,${mask.opacity / 100}) 100%)`
+    : `radial-gradient(${core}, rgba(0,0,0,${mask.opacity / 100}) 0%, rgba(0,0,0,${mask.opacity / 100}) ${solid}%, transparent 100%)`;
+};
+
+const effectMaskStyle = (clip: EditorClip, localFrame: number): React.CSSProperties => {
+  const masks = (clip.effectMasks ?? []).filter((mask) => mask.enabled && mask.target === "color");
+  if (masks.length) {
+    return {
+      WebkitMaskImage: masks.map((mask) => maskGradient(mask, localFrame)).join(", "),
+      maskImage: masks.map((mask) => maskGradient(mask, localFrame)).join(", "),
+      WebkitMaskComposite: masks.slice(1).map((mask) => mask.combineMode === "subtract" ? "destination-out" : mask.combineMode === "intersect" ? "source-in" : "source-over").join(", ") as React.CSSProperties["WebkitMaskComposite"],
+      maskComposite: masks.slice(1).map((mask) => mask.combineMode).join(", ") as React.CSSProperties["maskComposite"],
+    };
+  }
   const featherStart = clamp(100 - clip.effects.maskFeather, 0, 100);
   const gradient = clip.effects.maskInverted
     ? `radial-gradient(ellipse ${clip.effects.maskSize}% ${clip.effects.maskSize}% at ${clip.effects.maskX}% ${clip.effects.maskY}%, transparent 0%, transparent ${featherStart}%, black 100%)`
     : `radial-gradient(ellipse ${clip.effects.maskSize}% ${clip.effects.maskSize}% at ${clip.effects.maskX}% ${clip.effects.maskY}%, black 0%, black ${featherStart}%, transparent 100%)`;
   return {WebkitMaskImage: gradient, maskImage: gradient};
+};
+
+const curveTable = (points: ColorCurvePoint[] | undefined) => {
+  const ordered = [...(points ?? [{id: "black", x: 0, y: 0}, {id: "white", x: 1, y: 1}])].sort((left, right) => left.x - right.x);
+  return Array.from({length: 17}, (_, index) => {
+    const input = index / 16;
+    const rightIndex = ordered.findIndex((point) => point.x >= input);
+    if (rightIndex <= 0) return ordered[0]?.y ?? input;
+    const left = ordered[rightIndex - 1];
+    const right = ordered[rightIndex];
+    const progress = (input - left.x) / Math.max(Number.EPSILON, right.x - left.x);
+    return clamp(left.y + (right.y - left.y) * progress, 0, 1);
+  }).join(" ");
+};
+
+const AdvancedGradeFilter: React.FC<{clip: EditorClip; id: string}> = ({clip, id}) => {
+  const grade = clip.colorGrade;
+  if (!grade) return null;
+  return <svg width="0" height="0" aria-hidden="true" style={{position: "absolute"}}><filter id={id} colorInterpolationFilters="sRGB">
+    <feComponentTransfer>
+      <feFuncR type="table" tableValues={curveTable(grade.curves.master)} />
+      <feFuncG type="table" tableValues={curveTable(grade.curves.master)} />
+      <feFuncB type="table" tableValues={curveTable(grade.curves.master)} />
+    </feComponentTransfer>
+    <feComponentTransfer>
+      <feFuncR type="table" tableValues={curveTable(grade.curves.red)} />
+      <feFuncG type="table" tableValues={curveTable(grade.curves.green)} />
+      <feFuncB type="table" tableValues={curveTable(grade.curves.blue)} />
+    </feComponentTransfer>
+  </filter></svg>;
 };
 
 const TreatmentOverlays: React.FC<{clip: EditorClip; localFrame: number}> = ({clip, localFrame}) => {
@@ -116,12 +182,13 @@ const resolveMediaSource = (source: string) => /^(?:https?:|blob:|data:)/.test(s
 
 const VisualClip: React.FC<{clip: EditorClip; frameOffset: number; audioMultiplier: number; offline?: boolean; mediaName?: string; incoming?: EditorTransition; outgoing?: EditorTransition}> = ({clip, frameOffset, audioMultiplier, offline, mediaName, incoming, outgoing}) => {
   const localFrame = useCurrentFrame() + frameOffset;
-  const style = visualStyle(clip, localFrame);
+  const gradeFilterId = clip.colorGrade ? `grade-${clip.id.replace(/[^a-zA-Z0-9_-]/g, "-")}` : undefined;
+  const style = visualStyle(clip, localFrame, true, gradeFilterId);
   const baseStyle = visualStyle(clip, localFrame, false);
   const incomingActive = incoming && localFrame <= Math.ceil(incoming.duration / 2);
   const outgoingActive = outgoing && localFrame >= clip.duration - Math.floor(outgoing.duration / 2);
   const wrapperStyle = incomingActive ? transitionStyle(clip, incoming, "incoming", localFrame) : outgoingActive ? transitionStyle(clip, outgoing, "outgoing", localFrame) : {};
-  const maskedTreatment = Boolean(clip.effects.enabled && clip.effects.maskEnabled && (clip.kind === "video" || clip.kind === "image"));
+  const maskedTreatment = Boolean(clip.effects.enabled && (clip.effects.maskEnabled || clip.effectMasks?.some((mask) => mask.enabled && mask.target === "color")) && (clip.kind === "video" || clip.kind === "image"));
   const renderMedia = (mediaStyle: React.CSSProperties, withAudio: boolean) => {
     if (clip.kind === "video" && clip.src) {
       const playbackRate = getClipPlaybackRate(clip);
@@ -153,9 +220,9 @@ const VisualClip: React.FC<{clip: EditorClip; frameOffset: number; audioMultipli
   }
   if ((clip.kind === "video" || clip.kind === "image") && clip.src) {
     if (maskedTreatment) {
-      return <>{renderMedia(baseStyle, true)}<AbsoluteFill style={effectMaskStyle(clip)}>{renderMedia(style, false)}<TreatmentOverlays clip={clip} localFrame={localFrame} /></AbsoluteFill></>;
+      return <><AdvancedGradeFilter clip={clip} id={gradeFilterId ?? `grade-${clip.id}`} />{renderMedia(baseStyle, true)}<AbsoluteFill style={effectMaskStyle(clip, localFrame)}>{renderMedia(style, false)}<TreatmentOverlays clip={clip} localFrame={localFrame} /></AbsoluteFill></>;
     }
-    return renderMedia(style, true);
+    return <><AdvancedGradeFilter clip={clip} id={gradeFilterId ?? `grade-${clip.id}`} />{renderMedia(style, true)}</>;
   }
 
   if (clip.kind === "title" || clip.kind === "caption") {

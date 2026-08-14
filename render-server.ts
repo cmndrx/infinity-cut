@@ -4,12 +4,12 @@ import {randomUUID} from "node:crypto";
 import path from "node:path";
 import {pipeline} from "node:stream/promises";
 import {bundle} from "@remotion/bundler";
-import {makeCancelSignal, renderMedia, selectComposition, type Codec} from "@remotion/renderer";
+import {makeCancelSignal, renderMedia, selectComposition, type AudioCodec, type Codec, type PixelFormat} from "@remotion/renderer";
 import type {Connect, Plugin} from "vite";
 import type {EditorProject} from "./src/editor/types";
 
-type RenderFormat = "mp4" | "webm";
-type RenderQuality = "draft" | "standard" | "high";
+export type RenderFormat = "mp4" | "webm" | "hevc" | "prores";
+export type RenderQuality = "draft" | "standard" | "high";
 type RenderResolution = "source" | "720p";
 type RenderStage = "queued" | "bundling" | "rendering" | "complete" | "cancelled" | "error";
 
@@ -32,6 +32,23 @@ type RenderRequest = {
   quality?: RenderQuality;
   resolution?: RenderResolution;
   frameRange?: [number, number] | null;
+};
+
+export type RenderEncoding = {
+  codec: Codec;
+  extension: "mp4" | "webm" | "mov";
+  audioCodec: AudioCodec;
+  crf: number | null;
+  pixelFormat: PixelFormat;
+  proResProfile?: "proxy" | "standard" | "hq";
+  label: string;
+};
+
+export const resolveRenderEncoding = (format: RenderFormat | undefined, quality: RenderQuality): RenderEncoding => {
+  if (format === "webm") return {codec: "vp9", extension: "webm", audioCodec: "opus", crf: quality === "draft" ? 34 : quality === "high" ? 18 : 24, pixelFormat: "yuv420p", label: "VP9 + Opus"};
+  if (format === "hevc") return {codec: "h265", extension: "mp4", audioCodec: "aac", crf: quality === "draft" ? 30 : quality === "high" ? 18 : 23, pixelFormat: "yuv420p", label: "HEVC + AAC"};
+  if (format === "prores") return {codec: "prores", extension: "mov", audioCodec: "pcm-16", crf: null, pixelFormat: "yuv422p10le", proResProfile: quality === "draft" ? "proxy" : quality === "high" ? "hq" : "standard", label: `ProRes ${quality === "draft" ? "Proxy" : quality === "high" ? "422 HQ" : "422"} + PCM`};
+  return {codec: "h264", extension: "mp4", audioCodec: "aac", crf: quality === "draft" ? 28 : quality === "high" ? 16 : 20, pixelFormat: "yuv420p", label: "H.264 + AAC"};
 };
 
 const sendJson = (response: import("node:http").ServerResponse, status: number, value: unknown) => {
@@ -97,11 +114,10 @@ export const directorsCutProRenderPlugin = (): Plugin => {
 
     const startRender = async (job: RenderJob, request: RenderRequest) => {
       const {project} = request;
-      const format: RenderFormat = request.format === "webm" ? "webm" : "mp4";
+      const format: RenderFormat = ["webm", "hevc", "prores"].includes(request.format ?? "") ? request.format! : "mp4";
       const quality: RenderQuality = ["draft", "standard", "high"].includes(request.quality ?? "") ? request.quality! : "standard";
       const resolution: RenderResolution = request.resolution === "720p" ? "720p" : "source";
-      const codec: Codec = format === "webm" ? "vp9" : "h264";
-      const crf = quality === "draft" ? 28 : quality === "high" ? 16 : 20;
+      const encoding = resolveRenderEncoding(format, quality);
       const scale = resolution === "720p" ? Math.min(1, 720 / project.height) : 1;
       const {cancelSignal, cancel} = makeCancelSignal();
       job.cancel = cancel;
@@ -143,21 +159,24 @@ export const directorsCutProRenderPlugin = (): Plugin => {
           : null;
 
         await renderMedia({
-          codec,
+          codec: encoding.codec,
           composition,
           serveUrl,
           inputProps,
           outputLocation: job.outputPath,
           overwrite: true,
-          crf,
+          crf: encoding.crf,
           scale,
           frameRange,
           imageFormat: "jpeg",
           jpegQuality: quality === "draft" ? 72 : quality === "high" ? 95 : 86,
-          audioCodec: format === "webm" ? "opus" : "aac",
-          audioBitrate: quality === "draft" ? "128k" : quality === "high" ? "320k" : "192k",
-          pixelFormat: "yuv420p",
-          x264Preset: format === "mp4" ? "veryfast" : undefined,
+          audioCodec: encoding.audioCodec,
+          audioBitrate: format === "prores" ? undefined : quality === "draft" ? "128k" : quality === "high" ? "320k" : "192k",
+          pixelFormat: encoding.pixelFormat,
+          proResProfile: encoding.proResProfile,
+          preferLossless: format === "prores",
+          x264Preset: encoding.codec === "h264" ? "veryfast" : undefined,
+          hardwareAcceleration: encoding.codec === "h264" || encoding.codec === "h265" ? "if-possible" : "disable",
           cancelSignal,
           logLevel: "warn",
           onProgress: ({progress}) => {
@@ -246,9 +265,11 @@ export const directorsCutProRenderPlugin = (): Plugin => {
             return sendJson(response, 400, {error: "Invalid Directors Cut Pro project"});
           }
           const id = randomUUID();
-          const format = body.format === "webm" ? "webm" : "mp4";
+          const format: RenderFormat = ["webm", "hevc", "prores"].includes(body.format ?? "") ? body.format! : "mp4";
+          const quality: RenderQuality = ["draft", "standard", "high"].includes(body.quality ?? "") ? body.quality! : "standard";
+          const encoding = resolveRenderEncoding(format, quality);
           const baseName = safeFilename(body.project.name.toLowerCase()) || "directors-cut-pro-export";
-          const filename = `${baseName}-${id.slice(0, 8)}.${format}`;
+          const filename = `${baseName}-${id.slice(0, 8)}.${encoding.extension}`;
           const job: RenderJob = {
             id,
             stage: "queued",

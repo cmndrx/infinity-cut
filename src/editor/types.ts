@@ -22,6 +22,94 @@ export type Transform = {
   opacity: number;
 };
 
+export type ColorCurvePoint = {
+  id: string;
+  x: number;
+  y: number;
+};
+
+export type ColorCurveChannel = "master" | "red" | "green" | "blue";
+
+export type ColorWheel = {
+  x: number;
+  y: number;
+  luma: number;
+};
+
+export type HslSecondary = {
+  id: string;
+  name: string;
+  enabled: boolean;
+  hueStart: number;
+  hueEnd: number;
+  hueSoftness: number;
+  saturationMin: number;
+  saturationMax: number;
+  saturationSoftness: number;
+  luminanceMin: number;
+  luminanceMax: number;
+  luminanceSoftness: number;
+  correctionX: number;
+  correctionY: number;
+  exposure: number;
+  saturation: number;
+};
+
+export type ColorGrade = {
+  curves: Record<ColorCurveChannel, ColorCurvePoint[]>;
+  wheels: {
+    shadows: ColorWheel;
+    midtones: ColorWheel;
+    highlights: ColorWheel;
+  };
+  hslSecondaries: HslSecondary[];
+  lutId?: string;
+  lutIntensity: number;
+};
+
+export type MaskShape = "rectangle" | "ellipse";
+export type MaskCombineMode = "add" | "subtract" | "intersect";
+export type MaskTarget = "color" | "blur" | "vignette" | "grain" | "glow";
+export type MaskProperty = "x" | "y" | "width" | "height" | "rotation" | "feather" | "opacity";
+
+export type MaskKeyframe = {
+  id: string;
+  property: MaskProperty;
+  frame: number;
+  value: number;
+  easing: "linear" | "ease-in-out";
+  confidence?: number;
+};
+
+export type EditorEffectMask = {
+  id: string;
+  name: string;
+  target: MaskTarget;
+  shape: MaskShape;
+  enabled: boolean;
+  inverted: boolean;
+  combineMode: MaskCombineMode;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  rotation: number;
+  feather: number;
+  opacity: number;
+  keyframes: MaskKeyframe[];
+};
+
+export type ProjectLut = {
+  id: string;
+  name: string;
+  kind: "1d" | "3d";
+  size: number;
+  domainMin: [number, number, number];
+  domainMax: [number, number, number];
+  dataBase64: string;
+  fingerprint?: string;
+};
+
 export type Effects = {
   enabled: boolean;
   colorEnabled: boolean;
@@ -118,6 +206,8 @@ export type EditorClip = {
   preservePitch?: boolean;
   transform: Transform;
   effects: Effects;
+  colorGrade?: ColorGrade;
+  effectMasks?: EditorEffectMask[];
   keyframes: ClipKeyframe[];
   text?: string;
   textStyle?: TextStyle;
@@ -182,6 +272,7 @@ export type EditorProject = {
   transitions: EditorTransition[];
   mediaBins: MediaBin[];
   media: ProjectMedia[];
+  luts?: ProjectLut[];
   activeSequenceId: string;
   sequences: EditorSequence[];
 };
@@ -239,6 +330,27 @@ export const DEFAULT_EFFECTS: Effects = {
   maskY: 50,
   maskSize: 65,
   maskFeather: 35,
+};
+
+const identityCurve = (channel: ColorCurveChannel): ColorCurvePoint[] => [
+  {id: `${channel}-black`, x: 0, y: 0},
+  {id: `${channel}-white`, x: 1, y: 1},
+];
+
+export const DEFAULT_COLOR_GRADE: ColorGrade = {
+  curves: {
+    master: identityCurve("master"),
+    red: identityCurve("red"),
+    green: identityCurve("green"),
+    blue: identityCurve("blue"),
+  },
+  wheels: {
+    shadows: {x: 0, y: 0, luma: 0},
+    midtones: {x: 0, y: 0, luma: 0},
+    highlights: {x: 0, y: 0, luma: 0},
+  },
+  hslSecondaries: [],
+  lutIntensity: 100,
 };
 
 export const DEFAULT_TITLE_STYLE: TextStyle = {

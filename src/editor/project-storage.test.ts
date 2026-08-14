@@ -8,6 +8,7 @@ import {
   getStoredProject,
   importProjectValue,
   loadProjectLibrary,
+  normalizeProject,
   restoreRecoveryVersion,
   saveStoredProject,
 } from "./project-storage";
@@ -88,5 +89,24 @@ describe("project storage", () => {
     const project = blankProject("Portable");
     expect(importProjectValue(createProjectFile(project)).name).toBe("Portable");
     expect(importProjectValue(project).name).toBe("Portable");
+  });
+
+  it("migrates legacy color masks and defaults professional color data", () => {
+    const legacy = structuredClone(sampleProject);
+    const source = legacy.clips[0];
+    source.effects.maskEnabled = true;
+    source.effects.maskX = 22;
+    source.effects.maskY = 33;
+    source.effects.maskSize = 44;
+    delete source.colorGrade;
+    delete source.effectMasks;
+    delete legacy.luts;
+
+    const migrated = normalizeProject(legacy);
+    const clip = migrated.clips.find((candidate) => candidate.id === source.id)!;
+    expect(migrated.luts).toEqual([]);
+    expect(clip.colorGrade?.curves.master.map(({x, y}) => [x, y])).toEqual([[0, 0], [1, 1]]);
+    expect(clip.effectMasks).toEqual([expect.objectContaining({shape: "ellipse", target: "color", x: 22, y: 33, width: 44, height: 44})]);
+    expect(normalizeProject(migrated).clips.find((candidate) => candidate.id === source.id)?.effectMasks).toHaveLength(1);
   });
 });

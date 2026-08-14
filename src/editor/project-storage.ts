@@ -1,12 +1,14 @@
 import {sampleProject} from "./project";
 import {normalizeFrameRate} from "./frame-rate";
-import type {EditorProject, EditorSequence, EditorTrack} from "./types";
+import {normalizeColorGrade} from "./color-math";
+import {createDefaultMask, normalizeEffectMask} from "./masks";
+import type {EditorClip, EditorProject, EditorSequence, EditorTrack, ProjectLut} from "./types";
 import {syncActiveSequence} from "./sequences";
 import {DEFAULT_CAPTION_STYLE, DEFAULT_EFFECTS, DEFAULT_TITLE_STYLE} from "./types";
 
 export const PROJECT_LIBRARY_KEY = "infinity-cut-project-library-v2";
 export const LEGACY_PROJECT_KEY = "infinity-cut-project";
-export const PROJECT_SCHEMA_VERSION = 3;
+export const PROJECT_SCHEMA_VERSION = 4;
 
 const MAX_RECOVERY_VERSIONS = 8;
 const RECOVERY_INTERVAL_MS = 30_000;
@@ -83,6 +85,7 @@ export const createBlankProject = ({name, width, height, fps}: NewProjectSetting
     {id: "bin-graphics", name: "Graphics"},
   ],
   media: [],
+  luts: [],
   tracks: [
     defaultTrack("c1", "caption"),
     defaultTrack("v3", "video"),
@@ -120,25 +123,54 @@ export const normalizeProject = (value: unknown): EditorProject => {
     fps: normalizeFrameRate(item.fps),
     durationInSeconds: typeof item.durationInSeconds === "number" && Number.isFinite(item.durationInSeconds) && item.durationInSeconds > 0 ? item.durationInSeconds : undefined,
   }));
+  parsed.luts = Array.isArray(parsed.luts) ? parsed.luts.flatMap((lut) => {
+    if (!lut || typeof lut !== "object") return [];
+    const candidate = lut as ProjectLut;
+    if (typeof candidate.id !== "string" || !candidate.id.trim() || typeof candidate.name !== "string"
+      || (candidate.kind !== "1d" && candidate.kind !== "3d") || !Number.isInteger(candidate.size) || candidate.size < 2
+      || !Array.isArray(candidate.domainMin) || candidate.domainMin.length !== 3
+      || !Array.isArray(candidate.domainMax) || candidate.domainMax.length !== 3 || typeof candidate.dataBase64 !== "string") return [];
+    return [{...candidate, domainMin: [...candidate.domainMin], domainMax: [...candidate.domainMax]} as ProjectLut];
+  }) : [];
+
+  const normalizeClip = (clip: EditorClip): EditorClip => {
+    const effects = {...DEFAULT_EFFECTS, ...(clip.effects ?? {})};
+    const legacyMasks = effects.maskEnabled
+      ? [{
+        ...createDefaultMask(`${clip.id}-legacy-mask`, "ellipse", "Legacy Ellipse Mask"),
+        inverted: effects.maskInverted,
+        x: effects.maskX,
+        y: effects.maskY,
+        width: effects.maskSize,
+        height: effects.maskSize,
+        feather: effects.maskFeather,
+      }]
+      : [];
+    return {
+      ...clip,
+      fadeIn: clip.fadeIn ?? 0,
+      fadeOut: clip.fadeOut ?? 0,
+      audioMuted: clip.audioMuted ?? false,
+      playbackRate: typeof clip.playbackRate === "number" && Number.isFinite(clip.playbackRate) ? Math.max(0.1, Math.min(10, clip.playbackRate)) : 1,
+      preservePitch: clip.preservePitch ?? true,
+      keyframes: Array.isArray(clip.keyframes) ? clip.keyframes : [],
+      sourceMediaId: clip.sourceMediaId ?? parsed.media.find((item) => item.src === clip.src)?.id,
+      effects,
+      colorGrade: normalizeColorGrade(clip.colorGrade),
+      effectMasks: Array.isArray(clip.effectMasks)
+        ? clip.effectMasks.map((mask, index) => normalizeEffectMask(mask, `${clip.id}-mask-${index + 1}`))
+        : legacyMasks,
+      textStyle: clip.kind === "title"
+        ? {...DEFAULT_TITLE_STYLE, ...(clip.textStyle ?? {})}
+        : clip.kind === "caption"
+          ? {...DEFAULT_CAPTION_STYLE, ...(clip.textStyle ?? {})}
+          : clip.textStyle,
+    };
+  };
 
   if (!parsed.tracks.some((track) => track.kind === "caption")) parsed.tracks.unshift(defaultTrack("c1", "caption"));
   parsed.tracks = parsed.tracks.map((track) => ({...track, solo: track.solo ?? false, volume: track.volume ?? 1}));
-  parsed.clips = parsed.clips.map((clip) => ({
-    ...clip,
-    fadeIn: clip.fadeIn ?? 0,
-    fadeOut: clip.fadeOut ?? 0,
-    audioMuted: clip.audioMuted ?? false,
-    playbackRate: typeof clip.playbackRate === "number" && Number.isFinite(clip.playbackRate) ? Math.max(0.1, Math.min(10, clip.playbackRate)) : 1,
-    preservePitch: clip.preservePitch ?? true,
-    keyframes: Array.isArray(clip.keyframes) ? clip.keyframes : [],
-    sourceMediaId: clip.sourceMediaId ?? parsed.media.find((item) => item.src === clip.src)?.id,
-    effects: {...DEFAULT_EFFECTS, ...(clip.effects ?? {})},
-    textStyle: clip.kind === "title"
-      ? {...DEFAULT_TITLE_STYLE, ...(clip.textStyle ?? {})}
-      : clip.kind === "caption"
-        ? {...DEFAULT_CAPTION_STYLE, ...(clip.textStyle ?? {})}
-        : clip.textStyle,
-  }));
+  parsed.clips = parsed.clips.map(normalizeClip);
   parsed.activeSequenceId = typeof parsed.activeSequenceId === "string" && parsed.activeSequenceId ? parsed.activeSequenceId : "sequence-1";
   parsed.sequences = Array.isArray(parsed.sequences) ? parsed.sequences : [];
   if (!parsed.sequences.some((sequence) => sequence.id === parsed.activeSequenceId)) {
@@ -155,6 +187,13 @@ export const normalizeProject = (value: unknown): EditorProject => {
       transitions: clone(parsed.transitions),
     });
   }
+  parsed.sequences = parsed.sequences.map((sequence) => ({
+    ...sequence,
+    tracks: Array.isArray(sequence.tracks) ? sequence.tracks.map((track) => ({...track, solo: track.solo ?? false, volume: track.volume ?? 1})) : [],
+    clips: Array.isArray(sequence.clips) ? sequence.clips.map(normalizeClip) : [],
+    markers: Array.isArray(sequence.markers) ? sequence.markers : [],
+    transitions: Array.isArray(sequence.transitions) ? sequence.transitions : [],
+  }));
   return syncActiveSequence(parsed);
 };
 
@@ -169,7 +208,7 @@ const readLibrary = (storage: StorageLike): ProjectLibrary => {
   if (!raw) return emptyLibrary();
   try {
     const parsed = JSON.parse(raw) as ProjectLibrary;
-    if (![2, PROJECT_SCHEMA_VERSION].includes(Number(parsed.schemaVersion)) || !Array.isArray(parsed.projects)) return emptyLibrary();
+    if (![2, 3, PROJECT_SCHEMA_VERSION].includes(Number(parsed.schemaVersion)) || !Array.isArray(parsed.projects)) return emptyLibrary();
     return {
       schemaVersion: PROJECT_SCHEMA_VERSION,
       activeProjectId: typeof parsed.activeProjectId === "string" ? parsed.activeProjectId : null,

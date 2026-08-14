@@ -65,14 +65,19 @@ import {
   ZoomOut,
 } from "lucide-react";
 import {EditorComposition} from "./EditorComposition";
+import {ProfessionalColorControls} from "./ProfessionalColorControls";
+import {maskAtFrame, upsertMaskKeyframe} from "./masks";
+import {sourceTimeForTimelineFrame, trackTemplateTranslation, trackingRegionForMask} from "./tracking";
 import {getAnimatedPropertyValue, hasKeyframeAt, hasPropertyKeyframes} from "./animation";
 import {getClipPlaybackRate, getClipSourceSpan, MAX_PLAYBACK_RATE, MIN_PLAYBACK_RATE, playbackRateForDuration} from "./clip-speed";
 import {cloneClips, moveClips, placeMedia, retimeClip, rippleDelete, splitClip, trimClip, type CommandResult} from "./core";
 import {conformMediaToFrameRate, formatFrameRate, frameRatesMatch, normalizeFrameRate, retimeProjectForFrameRate} from "./frame-rate";
 import {createProjectFile, normalizeProject, saveStoredProject} from "./project-storage";
 import {canNestSequence, createSequence, switchActiveSequence, syncActiveSequence} from "./sequences";
+import {createReviewComment, createVersionSnapshot, diffProjects, setReviewCommentResolved, type ProjectVersionSnapshot, type ReviewComment} from "./collaboration";
+import {exportCmx3600Edl, exportFcp7Xml} from "./interchange";
 import type {EditorClip, EditorProject, EditorTrack, EditorTransition, KeyframeProperty, MediaKind, ProjectMedia, TextStyle, TransitionType} from "./types";
-import {DEFAULT_CAPTION_STYLE, DEFAULT_EFFECTS, DEFAULT_TITLE_STYLE, DEFAULT_TRANSFORM} from "./types";
+import {DEFAULT_CAPTION_STYLE, DEFAULT_COLOR_GRADE, DEFAULT_EFFECTS, DEFAULT_TITLE_STYLE, DEFAULT_TRANSFORM} from "./types";
 
 type MediaItem = ProjectMedia;
 type MediaView = "grid" | "list";
@@ -80,7 +85,7 @@ type MediaSort = "name" | "duration" | "type" | "date";
 type MediaFileAction = "relink" | "replace";
 type ScopeMode = "waveform" | "rgb";
 type ScopeData = {waveform: number[]; red: number[]; green: number[]; blue: number[]};
-type ExportFormat = "mp4" | "webm";
+type ExportFormat = "mp4" | "webm" | "hevc" | "prores";
 type ExportQuality = "draft" | "standard" | "high";
 type ExportResolution = "source" | "720p";
 type ExportRange = "sequence" | "selected";
@@ -198,6 +203,13 @@ const formatBytes = (bytes: number) => bytes >= 1024 * 1024
   ? `${(bytes / (1024 * 1024)).toFixed(1)} MB`
   : `${Math.max(1, Math.round(bytes / 1024))} KB`;
 
+const EXPORT_FORMAT_LABELS: Record<ExportFormat, {name: string; summary: string; download: string}> = {
+  mp4: {name: "MP4 (H.264)", summary: "H.264 + AAC", download: "MP4"},
+  hevc: {name: "MP4 (HEVC / H.265)", summary: "HEVC + AAC", download: "HEVC"},
+  prores: {name: "QuickTime (Apple ProRes 422)", summary: "ProRes 422 + PCM", download: "MOV"},
+  webm: {name: "WebM (VP9)", summary: "VP9 + Opus", download: "WEBM"},
+};
+
 const formatTimecode = (frame: number, fps: number) => {
   const safe = Math.max(0, Math.round(frame));
   const nominalFps = Math.max(1, Math.round(fps));
@@ -295,6 +307,9 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
   const [activeLeftTab, setActiveLeftTab] = useState<"project" | "color" | "effects" | "text" | "audio">("project");
   const [scopeMode, setScopeMode] = useState<ScopeMode>("waveform");
   const [scopeData, setScopeData] = useState<ScopeData>({waveform: Array(48).fill(0.5), red: Array(32).fill(0), green: Array(32).fill(0), blue: Array(32).fill(0)});
+  const [selectedMaskId, setSelectedMaskId] = useState<string | null>(null);
+  const [showMaskOverlay, setShowMaskOverlay] = useState(true);
+  const [maskTracking, setMaskTracking] = useState<{running: boolean; progress: number; confidence?: number}>({running: false, progress: 0});
   const [selectedMediaId, setSelectedMediaId] = useState<string | null>(null);
   const [activeBinId, setActiveBinId] = useState<"all" | string>("all");
   const [mediaView, setMediaView] = useState<MediaView>("grid");
@@ -312,6 +327,14 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
   const [waveforms, setWaveforms] = useState<Record<string, number[]>>({});
   const [toast, setToast] = useState("Autosaved just now");
   const [exportOpen, setExportOpen] = useState(false);
+  const [reviewOpen, setReviewOpen] = useState(false);
+  const [reviewCommentText, setReviewCommentText] = useState("");
+  const [reviewComments, setReviewComments] = useState<ReviewComment[]>(() => {
+    try { return JSON.parse(window.localStorage.getItem(`directors-review-comments:${projectId}`) ?? "[]") as ReviewComment[]; } catch { return []; }
+  });
+  const [projectVersions, setProjectVersions] = useState<ProjectVersionSnapshot[]>(() => {
+    try { return JSON.parse(window.localStorage.getItem(`directors-project-versions:${projectId}`) ?? "[]") as ProjectVersionSnapshot[]; } catch { return []; }
+  });
   const [exportFormat, setExportFormat] = useState<ExportFormat>("mp4");
   const [exportQuality, setExportQuality] = useState<ExportQuality>("standard");
   const [exportResolution, setExportResolution] = useState<ExportResolution>("source");
@@ -337,6 +360,8 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
   const marqueeRef = useRef<MarqueeState | null>(null);
   const waveformRequestsRef = useRef<Set<string>>(new Set());
   const frameRateChoiceResolverRef = useRef<((choice: FrameRateChoice) => void) | null>(null);
+  const maskDragRef = useRef<{maskId: string; clientX: number; clientY: number; x: number; y: number; width: number; height: number; mode: "move" | "resize"; corner?: "nw" | "ne" | "sw" | "se"} | null>(null);
+  const cancelMaskTrackingRef = useRef(false);
 
   useEffect(() => {
     if (drag) return;
@@ -362,6 +387,14 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
     window.addEventListener("beforeunload", saveBeforeClose);
     return () => window.removeEventListener("beforeunload", saveBeforeClose);
   }, [projectId]);
+
+  useEffect(() => {
+    window.localStorage.setItem(`directors-review-comments:${projectId}`, JSON.stringify(reviewComments));
+  }, [projectId, reviewComments]);
+
+  useEffect(() => {
+    window.localStorage.setItem(`directors-project-versions:${projectId}`, JSON.stringify(projectVersions.slice(-20)));
+  }, [projectId, projectVersions]);
 
   useEffect(() => {
     setDestinationRoutes((current) => {
@@ -1420,6 +1453,8 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
   const selectedLocalFrame = selectedClip ? clamp(frame - selectedClip.start, 0, selectedClip.duration - 1) : 0;
   const selectedTextStyle = selectedClip?.kind === "caption" ? {...DEFAULT_CAPTION_STYLE, ...(selectedClip.textStyle ?? {})} : {...DEFAULT_TITLE_STYLE, ...(selectedClip?.textStyle ?? {})};
   const selectedEffects = selectedClip ? {...DEFAULT_EFFECTS, ...selectedClip.effects} : DEFAULT_EFFECTS;
+  const selectedColorGrade = selectedClip?.colorGrade ?? DEFAULT_COLOR_GRADE;
+  const selectedProgramMask = selectedClip?.effectMasks?.find((mask) => mask.id === selectedMaskId) ?? selectedClip?.effectMasks?.find((mask) => mask.enabled) ?? null;
   const waveformPoints = scopeData.waveform.map((value, index) => `${(index / Math.max(1, scopeData.waveform.length - 1)) * 210},${96 - value * 86}`).join(" ");
 
   const propertyPath = (key: PropertyGroup, property: string) => `${key}.${property}` as KeyframeProperty;
@@ -1460,6 +1495,94 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
       clip.effects = {...DEFAULT_EFFECTS, ...clip.effects, ...updates};
     }, message);
   }, [commit, selectedClipId]);
+
+  const updateSelectedColorGrade = useCallback((colorGrade: EditorClip["colorGrade"], message?: string) => {
+    if (!selectedClipId || !colorGrade) return;
+    commit((draft) => {
+      const clip = draft.clips.find((item) => item.id === selectedClipId);
+      if (clip) clip.colorGrade = JSON.parse(JSON.stringify(colorGrade)) as NonNullable<EditorClip["colorGrade"]>;
+    }, message);
+  }, [commit, selectedClipId]);
+
+  const updateSelectedMasks = useCallback((effectMasks: NonNullable<EditorClip["effectMasks"]>, message?: string) => {
+    if (!selectedClipId) return;
+    commit((draft) => {
+      const clip = draft.clips.find((item) => item.id === selectedClipId);
+      if (clip) clip.effectMasks = JSON.parse(JSON.stringify(effectMasks)) as NonNullable<EditorClip["effectMasks"]>;
+    }, message);
+  }, [commit, selectedClipId]);
+
+  const updateProjectLuts = useCallback((luts: NonNullable<EditorProject["luts"]>, message?: string) => {
+    commit((draft) => { draft.luts = JSON.parse(JSON.stringify(luts)) as NonNullable<EditorProject["luts"]>; }, message);
+  }, [commit]);
+
+  const trackSelectedMask = useCallback(async (mode: "back" | "forward" | "range") => {
+    if (!selectedClip || selectedClip.kind !== "video" || !selectedClip.src || !selectedProgramMask || maskTracking.running) {
+      setToast("Select a video clip and an enabled mask to track motion");
+      return;
+    }
+    cancelMaskTrackingRef.current = false;
+    setMaskTracking({running: true, progress: 0});
+    const video = document.createElement("video");
+    video.muted = true;
+    video.preload = "auto";
+    video.crossOrigin = "anonymous";
+    video.src = selectedClip.src;
+    const loaded = new Promise<void>((resolve, reject) => {
+      video.addEventListener("loadedmetadata", () => resolve(), {once: true});
+      video.addEventListener("error", () => reject(new Error("The clip could not be decoded for tracking")), {once: true});
+    });
+    try {
+      await loaded;
+      const width = 160;
+      const height = Math.max(90, Math.round(width / Math.max(1, video.videoWidth / Math.max(1, video.videoHeight))));
+      const canvas = document.createElement("canvas");
+      canvas.width = width;
+      canvas.height = height;
+      const context = canvas.getContext("2d", {willReadFrequently: true});
+      if (!context) throw new Error("Mask tracker could not create its analysis surface");
+      const capture = async (localFrame: number) => {
+        const time = Math.min(Math.max(0, video.duration - .001), sourceTimeForTimelineFrame(localFrame, selectedClip.sourceStart, getClipPlaybackRate(selectedClip), project.fps));
+        if (Math.abs(video.currentTime - time) > .0001) await new Promise<void>((resolve) => {video.addEventListener("seeked", () => resolve(), {once: true}); video.currentTime = time;});
+        context.drawImage(video, 0, 0, width, height);
+        const rgba = context.getImageData(0, 0, width, height).data;
+        const data = new Uint8Array(width * height);
+        for (let index = 0; index < data.length; index++) data[index] = Math.round(rgba[index * 4] * .2126 + rgba[index * 4 + 1] * .7152 + rgba[index * 4 + 2] * .0722);
+        return {width, height, data};
+      };
+      const currentLocal = clamp(frame - selectedClip.start, 0, selectedClip.duration - 1);
+      const targets = mode === "back" ? [Math.max(0, currentLocal - 1)] : mode === "forward" ? [Math.min(selectedClip.duration - 1, currentLocal + 1)] : Array.from({length: Math.max(0, selectedClip.duration - currentLocal - 1)}, (_, index) => currentLocal + index + 1);
+      if (!targets.length || targets[0] === currentLocal) throw new Error("The playhead is already at the tracking boundary");
+      let previousLocal = currentLocal;
+      let previousFrame = await capture(previousLocal);
+      let trackedMask = JSON.parse(JSON.stringify(selectedProgramMask)) as typeof selectedProgramMask;
+      let lastConfidence = 0;
+      for (let index = 0; index < targets.length; index++) {
+        if (cancelMaskTrackingRef.current) break;
+        const target = targets[index];
+        const destination = await capture(target);
+        const region = trackingRegionForMask(trackedMask, width, height, previousLocal);
+        const result = trackTemplateTranslation(previousFrame, destination, region, {searchRadius: 10, sampleStep: 3});
+        const base = maskAtFrame(trackedMask, previousLocal);
+        const nextX = result.confidence >= .55 ? base.x + (result.dx / width) * 100 : base.x;
+        const nextY = result.confidence >= .55 ? base.y + (result.dy / height) * 100 : base.y;
+        trackedMask = upsertMaskKeyframe(upsertMaskKeyframe(trackedMask, "x", target, nextX, {confidence: result.confidence}), "y", target, nextY, {confidence: result.confidence});
+        lastConfidence = result.confidence;
+        previousFrame = destination;
+        previousLocal = target;
+        setMaskTracking({running: true, progress: (index + 1) / targets.length, confidence: result.confidence});
+        await new Promise<void>((resolve) => window.setTimeout(resolve, 0));
+      }
+      updateSelectedMasks((selectedClip.effectMasks ?? []).map((mask) => mask.id === trackedMask.id ? trackedMask : mask), cancelMaskTrackingRef.current ? "Mask tracking stopped" : `Tracked mask · ${Math.round(lastConfidence * 100)}% confidence`);
+      setMaskTracking({running: false, progress: 1, confidence: lastConfidence});
+    } catch (error) {
+      setMaskTracking({running: false, progress: 0});
+      setToast(error instanceof Error ? error.message : "Mask tracking failed");
+    } finally {
+      video.removeAttribute("src");
+      video.load();
+    }
+  }, [frame, maskTracking.running, project.fps, selectedClip, selectedProgramMask, updateSelectedMasks]);
 
   const applyColorPreset = useCallback((preset: typeof COLOR_PRESETS[number]) => {
     updateSelectedEffects({...preset.values, enabled: true, colorEnabled: true}, `Applied ${preset.name} look`);
@@ -1712,6 +1835,17 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
     setToast("Editable project file exported");
   };
 
+  const exportInterchange = (format: "edl" | "xml") => {
+    const artifact = format === "edl" ? exportCmx3600Edl(syncActiveSequence(project)) : exportFcp7Xml(syncActiveSequence(project));
+    const url = URL.createObjectURL(new Blob([artifact.content], {type: artifact.mimeType}));
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = artifact.filename;
+    anchor.click();
+    URL.revokeObjectURL(url);
+    setToast(artifact.warnings.length ? `Exported ${format.toUpperCase()} with ${artifact.warnings.length} compatibility warnings` : `Exported ${format.toUpperCase()} interchange`);
+  };
+
   const startVideoExport = async () => {
     const browserOnlyClips = project.clips.filter((clip) => clip.src?.startsWith("blob:"));
     if (browserOnlyClips.length) {
@@ -1752,6 +1886,32 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
     await fetch(`/api/render/${renderJob.id}`, {method: "DELETE"}).catch(() => undefined);
     setRenderJob((current) => current ? {...current, stage: "cancelled", message: "Export cancelled"} : current);
     setToast("Video export cancelled");
+  };
+
+  const addReviewComment = () => {
+    if (!reviewCommentText.trim()) return;
+    try {
+      const comment = createReviewComment({sequenceId: project.activeSequenceId, frame, author: "You", body: reviewCommentText});
+      setReviewComments((current) => [comment, ...current]);
+      setReviewCommentText("");
+      setToast(`Review note added at ${formatTimecode(frame, project.fps)}`);
+    } catch (error) {
+      setToast(error instanceof Error ? error.message : "Could not add review note");
+    }
+  };
+
+  const saveReviewVersion = () => {
+    const revision = (projectVersions[projectVersions.length - 1]?.revision ?? 0) + 1;
+    const snapshot = createVersionSnapshot(syncActiveSequence(project), {revision, parentRevision: revision > 1 ? revision - 1 : undefined, author: "You", label: `Review ${revision}`});
+    setProjectVersions((current) => [...current.slice(-19), snapshot]);
+    setToast(`Saved Review ${revision}`);
+  };
+
+  const restoreReviewVersion = (version: ProjectVersionSnapshot) => {
+    setPast((current) => [...current.slice(-49), cloneProject(project)]);
+    setFuture([]);
+    setProject(normalizeProject(version.project));
+    setToast(`Restored ${version.label ?? `revision ${version.revision}`}`);
   };
 
   const renderJobId = renderJob?.id;
@@ -2090,6 +2250,7 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
   };
 
   const exportIsActive = Boolean(renderJob && ["queued", "bundling", "rendering"].includes(renderJob.stage));
+  const currentVersionChanges = projectVersions.length ? diffProjects(projectVersions[projectVersions.length - 1].project, project) : [];
   const speedDialogClip = speedDialog ? project.clips.find((clip) => clip.id === speedDialog.clipId) : null;
   const exportScale = exportResolution === "720p" ? Math.min(1, 720 / project.height) : 1;
   const exportWidth = Math.max(2, Math.round((project.width * exportScale) / 2) * 2);
@@ -2097,7 +2258,7 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
   const exportFrames = exportRange === "selected" && selectedClip ? selectedClip.duration : project.durationInFrames;
 
   return (
-    <div className="editor-shell">
+    <div className={`editor-shell ${activeLeftTab === "color" ? "color-active" : ""}`}>
       {frameRateMismatch && (
         <div className="frame-rate-overlay">
           <section className="frame-rate-dialog" role="dialog" aria-modal="true" aria-labelledby="frame-rate-dialog-title">
@@ -2150,6 +2311,48 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
           </section>
         </div>
       )}
+      {reviewOpen && (
+        <div className="review-overlay" onPointerDown={(event) => event.target === event.currentTarget && setReviewOpen(false)}>
+          <section className="review-dialog" role="dialog" aria-modal="true" aria-labelledby="review-dialog-title">
+            <header>
+              <div className="review-dialog-icon"><MessageSquare size={18} /></div>
+              <div><strong id="review-dialog-title">Review & versions</strong><small>Frame-accurate notes and local version comparison</small></div>
+              <button onClick={() => setReviewOpen(false)} title="Close review"><X size={16} /></button>
+            </header>
+            <div className="review-columns">
+              <section className="review-comments-column">
+                <div className="review-section-heading"><span>Sequence comments</span><b>{reviewComments.filter((item) => item.status === "open").length} open</b></div>
+                <div className="review-composer">
+                  <div><MessageSquare size={13} /><span>{formatTimecode(frame, project.fps)}</span><small>{activeSequence?.name ?? "Sequence"}</small></div>
+                  <textarea aria-label="Review comment" value={reviewCommentText} onChange={(event) => setReviewCommentText(event.target.value)} placeholder="Leave a precise note at the playhead…" rows={3} />
+                  <button disabled={!reviewCommentText.trim()} onClick={addReviewComment}>Add comment</button>
+                </div>
+                <div className="review-comment-list">
+                  {reviewComments.length ? reviewComments.map((comment) => <article className={comment.status === "resolved" ? "resolved" : ""} key={comment.id}>
+                    <button className="review-timecode" onClick={() => {if (comment.sequenceId === project.activeSequenceId) seek(comment.frame); setReviewOpen(false);}}>{formatTimecode(comment.frame, project.fps)}</button>
+                    <div><strong>{comment.author}</strong><p>{comment.body}</p><small>{comment.status === "resolved" ? "Resolved" : "Needs review"}</small></div>
+                    <button onClick={() => setReviewComments((current) => current.map((item) => item.id === comment.id ? setReviewCommentResolved(item, item.status !== "resolved") : item))}>{comment.status === "resolved" ? "Reopen" : "Resolve"}</button>
+                  </article>) : <div className="review-empty"><MessageSquare size={22} /><strong>No review notes yet</strong><span>Add a note tied to the current playhead.</span></div>}
+                </div>
+              </section>
+              <section className="review-versions-column">
+                <div className="review-section-heading"><span>Version history</span><b>{projectVersions.length} saved</b></div>
+                <button className="save-review-version" onClick={saveReviewVersion}><Save size={14} /><span><strong>Save review version</strong><small>{currentVersionChanges.length ? `${currentVersionChanges.length} changes since last version` : projectVersions.length ? "No changes since last version" : "Create a comparison baseline"}</small></span></button>
+                {projectVersions.length ? <div className="review-diff-list"><header><span>Changes since {projectVersions[projectVersions.length - 1].label ?? `revision ${projectVersions[projectVersions.length - 1].revision}`}</span><b>{currentVersionChanges.length}</b></header>{currentVersionChanges.length ? currentVersionChanges.slice(0, 8).map((change, index) => <div key={`${change.entityType}-${change.entityId}-${change.category}-${index}`}><i className={change.category}>{change.category}</i><span><strong>{change.label}</strong><small>{change.entityType} · {change.category}</small></span></div>) : <p>Current edit matches the saved baseline.</p>}{currentVersionChanges.length > 8 ? <footer>+ {currentVersionChanges.length - 8} more changes</footer> : null}</div> : null}
+                <div className="review-version-list">
+                  {[...projectVersions].reverse().map((version, index) => {
+                    const newer = index === 0 ? project : projectVersions[projectVersions.length - index]?.project;
+                    const changes = newer ? diffProjects(version.project, newer).length : 0;
+                    return <article key={version.id}><div><strong>{version.label ?? `Revision ${version.revision}`}</strong><span>{new Date(version.createdAt).toLocaleString()}</span><small>{changes} semantic {changes === 1 ? "change" : "changes"} after this version · {version.checksum}</small></div><button onClick={() => restoreReviewVersion(version)}>Restore</button></article>;
+                  })}
+                  {!projectVersions.length && <div className="review-empty"><Save size={22} /><strong>No review versions</strong><span>Save a named baseline before major edits.</span></div>}
+                </div>
+                <div className="review-boundary"><Info size={13} /><span>These review records are stored with this browser project. Secure shared projects, permissions, cloud media, and external approvals require a connected collaboration service.</span></div>
+              </section>
+            </div>
+          </section>
+        </div>
+      )}
       {exportOpen && (
         <div className="export-overlay" onPointerDown={(event) => event.target === event.currentTarget && setExportOpen(false)}>
           <section className="export-dialog" role="dialog" aria-modal="true" aria-labelledby="export-dialog-title">
@@ -2159,11 +2362,11 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
               <button onClick={() => setExportOpen(false)} title="Close export"><X size={16} /></button>
             </header>
             <div className="export-summary">
-              <div className="export-summary-frame"><Film size={25} /><span>Sequence 01</span></div>
-              <div><strong>{project.name}</strong><span>{exportWidth} × {exportHeight}</span><span>{formatFrameRate(project.fps)} fps · {formatTimecode(exportFrames, project.fps)}</span><span>{exportFormat === "mp4" ? "H.264 + AAC" : "VP9 + Opus"}</span></div>
+              <div className="export-summary-frame"><Film size={25} /><span>{activeSequence?.name ?? "Active sequence"}</span></div>
+              <div><strong>{project.name}</strong><span>{exportWidth} × {exportHeight}</span><span>{formatFrameRate(project.fps)} fps · {formatTimecode(exportFrames, project.fps)}</span><span>{EXPORT_FORMAT_LABELS[exportFormat].summary}</span></div>
             </div>
             <div className="export-settings">
-              <label><span>Format</span><select aria-label="Export format" disabled={exportIsActive || renderStarting} value={exportFormat} onChange={(event) => setExportFormat(event.target.value as ExportFormat)}><option value="mp4">MP4 (H.264)</option><option value="webm">WebM (VP9)</option></select></label>
+              <label><span>Format</span><select aria-label="Export format" disabled={exportIsActive || renderStarting} value={exportFormat} onChange={(event) => setExportFormat(event.target.value as ExportFormat)}>{(Object.entries(EXPORT_FORMAT_LABELS) as Array<[ExportFormat, {name: string; summary: string; download: string}]>).map(([format, details]) => <option key={format} value={format}>{details.name}</option>)}</select></label>
               <label><span>Resolution</span><select aria-label="Export resolution" disabled={exportIsActive || renderStarting} value={exportResolution} onChange={(event) => setExportResolution(event.target.value as ExportResolution)}><option value="source">Source ({project.width} × {project.height})</option><option value="720p">720p preview</option></select></label>
               <label><span>Quality</span><select aria-label="Export quality" disabled={exportIsActive || renderStarting} value={exportQuality} onChange={(event) => setExportQuality(event.target.value as ExportQuality)}><option value="draft">Draft · faster</option><option value="standard">Standard</option><option value="high">High quality</option></select></label>
               <label><span>Range</span><select aria-label="Export range" disabled={exportIsActive || renderStarting} value={exportRange} onChange={(event) => setExportRange(event.target.value as ExportRange)}><option value="sequence">Entire sequence</option><option value="selected" disabled={!selectedClip}>Selected clip{selectedClip ? ` · ${selectedClip.name}` : ""}</option></select></label>
@@ -2180,10 +2383,12 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
             )}
             <footer>
               <button className="project-export-button" onClick={exportProjectFile}><Save size={14} /> Project file</button>
+              <button className="project-export-button" onClick={() => exportInterchange("edl")} title="Export CMX 3600 edit decision list">EDL</button>
+              <button className="project-export-button" onClick={() => exportInterchange("xml")} title="Export Final Cut Pro 7 XML for Premiere Pro and Resolve">XML</button>
               <span />
               {exportIsActive ? <button className="cancel-render-button" onClick={() => void cancelVideoExport()}>Cancel render</button> : null}
               {renderJob?.stage === "complete" && renderJob.downloadUrl ? (
-                <a className="download-video-button" href={renderJob.downloadUrl} download={renderJob.filename}><Download size={15} /> Download {exportFormat.toUpperCase()}</a>
+                <a className="download-video-button" href={renderJob.downloadUrl} download={renderJob.filename}><Download size={15} /> Download {EXPORT_FORMAT_LABELS[exportFormat].download}</a>
               ) : (
                 <button className="start-render-button" disabled={renderStarting || exportIsActive} onClick={() => void startVideoExport()}>{renderStarting ? <LoaderCircle className="spinning" size={15} /> : <FileVideo2 size={15} />} {renderJob?.stage === "error" || renderJob?.stage === "cancelled" ? "Try again" : "Render video"}</button>
               )}
@@ -2218,7 +2423,7 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
         <div className="top-actions">
           <button className="icon-button" onClick={undo} disabled={!past.length} title="Undo (⌘Z)"><Undo2 size={16} /></button>
           <button className="icon-button" onClick={redo} disabled={!future.length} title="Redo (⇧⌘Z)"><Redo2 size={16} /></button>
-          <button className="quiet-button"><MessageSquare size={15} /> Review</button>
+          <button className="quiet-button" onClick={() => setReviewOpen(true)}><MessageSquare size={15} /> Review{reviewComments.some((item) => item.status === "open") ? <i className="review-count">{reviewComments.filter((item) => item.status === "open").length}</i> : null}</button>
           <button className="quiet-button" onClick={saveProject}><Save size={15} /> Save</button>
           <button className="export-button" onClick={() => {if (!exportIsActive) setRenderJob(null); setExportOpen(true);}}><Download size={15} /> Export</button>
           <button className="icon-button"><CircleHelp size={17} /></button>
@@ -2328,7 +2533,7 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
             </div>
           ) : activeLeftTab === "color" ? (
             <div className="color-workspace">
-              {selectedClip && selectedClip.kind !== "audio" && selectedClip.kind !== "caption" ? <>
+              {selectedClip && (selectedClip.kind === "video" || selectedClip.kind === "image") ? <>
                 <div className="color-clip-header">
                   <span style={{background: selectedClip.color}}>{clipIcon(selectedClip.kind, 14)}</span>
                   <div><strong>{selectedClip.name}</strong><small>{selectedEffects.look} · Lumetri Color</small></div>
@@ -2370,6 +2575,20 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
                   <ColorControl label="Faded film" value={propertyValue("effects", "fade")} min={0} max={100} onChange={(value) => updateSelected("effects", "fade", value)} />
                   <ColorControl label="Sharpen" value={propertyValue("effects", "sharpen")} min={0} max={100} onChange={(value) => updateSelected("effects", "sharpen", value)} />
                 </section>
+                <ProfessionalColorControls
+                  grade={selectedColorGrade}
+                  luts={project.luts ?? []}
+                  masks={selectedClip.effectMasks ?? []}
+                  selectedMaskId={selectedProgramMask?.id ?? null}
+                  showOverlay={showMaskOverlay}
+                  tracking={maskTracking}
+                  onGrade={updateSelectedColorGrade}
+                  onLuts={updateProjectLuts}
+                  onMasks={updateSelectedMasks}
+                  onSelectMask={setSelectedMaskId}
+                  onToggleOverlay={() => setShowMaskOverlay((value) => !value)}
+                  onTrack={(mode) => mode === "cancel" ? (cancelMaskTrackingRef.current = true) : void trackSelectedMask(mode)}
+                />
                 <section className="color-module effect-stack">
                   <header><Layers3 size={12} /><span>Effect stack</span><small>Fixed render order</small></header>
                   {([
@@ -2383,13 +2602,6 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
                     <input aria-label={effect.name} type="range" min={0} max={effect.max} step={effect.amount === "blur" ? .5 : 1} value={effect.value} onChange={(event) => updateSelected("effects", effect.amount, Number(event.target.value))} />
                     <button onClick={() => updateSelectedEffects({[effect.amount]: 0} as Partial<EditorClip["effects"]>)} title={`Remove ${effect.name}`}><X size={11} /></button>
                   </div>)}
-                </section>
-                <section className="color-module mask-module">
-                  <header><button onClick={() => updateSelectedEffects({maskEnabled: !selectedEffects.maskEnabled})}>{selectedEffects.maskEnabled ? <Eye size={12} /> : <EyeOff size={12} />}</button><span>Ellipse mask</span><button className={selectedEffects.maskInverted ? "active" : ""} onClick={() => updateSelectedEffects({maskInverted: !selectedEffects.maskInverted})}>Invert</button></header>
-                  <ColorControl label="Position X" value={selectedEffects.maskX} min={0} max={100} suffix="%" onChange={(value) => updateSelectedEffects({maskX: value})} />
-                  <ColorControl label="Position Y" value={selectedEffects.maskY} min={0} max={100} suffix="%" onChange={(value) => updateSelectedEffects({maskY: value})} />
-                  <ColorControl label="Size" value={selectedEffects.maskSize} min={10} max={140} suffix="%" onChange={(value) => updateSelectedEffects({maskSize: value})} />
-                  <ColorControl label="Feather" value={selectedEffects.maskFeather} min={0} max={100} suffix="%" onChange={(value) => updateSelectedEffects({maskFeather: value})} />
                 </section>
               </> : <div className="color-empty"><Palette size={28} /><strong>Select a visual clip</strong><small>Color correction, looks, effects, masks, and scopes appear here.</small></div>}
             </div>
@@ -2495,6 +2707,44 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
                 style={{width: "100%", height: "100%"}}
               />
             </div>}
+            {monitorMode === "program" && activeLeftTab === "color" && showMaskOverlay && selectedProgramMask ? <div
+              className={`program-mask-overlay ${selectedProgramMask.shape}`}
+              style={{left: `${selectedProgramMask.x}%`, top: `${selectedProgramMask.y}%`, width: `${selectedProgramMask.width}%`, height: `${selectedProgramMask.height}%`, transform: `translate(-50%,-50%) rotate(${selectedProgramMask.rotation}deg)`}}
+              onPointerDown={(event) => {
+                if ((event.target as HTMLElement).tagName === "I") return;
+                event.currentTarget.setPointerCapture(event.pointerId);
+                maskDragRef.current = {maskId: selectedProgramMask.id, clientX: event.clientX, clientY: event.clientY, x: selectedProgramMask.x, y: selectedProgramMask.y, width: selectedProgramMask.width, height: selectedProgramMask.height, mode: "move"};
+              }}
+              onPointerMove={(event) => {
+                const dragState = maskDragRef.current;
+                if (!dragState || !event.currentTarget.hasPointerCapture(event.pointerId)) return;
+                const dx = event.clientX - dragState.clientX;
+                const dy = event.clientY - dragState.clientY;
+                if (dragState.mode === "resize") {
+                  const signX = dragState.corner?.includes("e") ? 1 : -1;
+                  const signY = dragState.corner?.includes("s") ? 1 : -1;
+                  event.currentTarget.style.width = `calc(${dragState.width}% + ${dx * signX}px)`;
+                  event.currentTarget.style.height = `calc(${dragState.height}% + ${dy * signY}px)`;
+                  event.currentTarget.style.transform = `translate(calc(-50% + ${dx / 2}px),calc(-50% + ${dy / 2}px)) rotate(${selectedProgramMask.rotation}deg)`;
+                } else event.currentTarget.style.transform = `translate(calc(-50% + ${dx}px),calc(-50% + ${dy}px)) rotate(${selectedProgramMask.rotation}deg)`;
+              }}
+              onPointerUp={(event) => {
+                const dragState = maskDragRef.current;
+                maskDragRef.current = null;
+                if (!dragState) return;
+                const stage = event.currentTarget.parentElement?.getBoundingClientRect();
+                if (!stage) return;
+                const dx = event.clientX - dragState.clientX;
+                const dy = event.clientY - dragState.clientY;
+                const signX = dragState.corner?.includes("e") ? 1 : -1;
+                const signY = dragState.corner?.includes("s") ? 1 : -1;
+                const updates = dragState.mode === "resize"
+                  ? {x: clamp(dragState.x + (dx / stage.width) * 50, -200, 300), y: clamp(dragState.y + (dy / stage.height) * 50, -200, 300), width: clamp(dragState.width + (dx / stage.width) * signX * 100, .1, 400), height: clamp(dragState.height + (dy / stage.height) * signY * 100, .1, 400)}
+                  : {x: clamp(dragState.x + (dx / stage.width) * 100, -200, 300), y: clamp(dragState.y + (dy / stage.height) * 100, -200, 300)};
+                updateSelectedMasks((selectedClip?.effectMasks ?? []).map((mask) => mask.id === dragState.maskId ? {...mask, ...updates} : mask), dragState.mode === "resize" ? "Resized effect mask" : "Moved effect mask");
+              }}
+              title={`Drag ${selectedProgramMask.name}`}
+            ><b>{selectedProgramMask.name}</b>{(["nw", "ne", "sw", "se"] as const).map((corner) => <i key={corner} className={corner} onPointerDown={(event) => {event.stopPropagation(); event.currentTarget.parentElement?.setPointerCapture(event.pointerId); maskDragRef.current = {maskId: selectedProgramMask.id, clientX: event.clientX, clientY: event.clientY, x: selectedProgramMask.x, y: selectedProgramMask.y, width: selectedProgramMask.width, height: selectedProgramMask.height, mode: "resize", corner};}} />)}</div> : null}
           </div>
           {monitorMode === "source" && selectedMedia && sourceRange ? <div className="source-transport">
             <div className="source-range-bar">
