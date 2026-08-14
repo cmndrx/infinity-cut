@@ -4,6 +4,7 @@ import {getAnimatedPropertyValue} from "./animation";
 import {getClipPlaybackRate} from "./clip-speed";
 import type {EditorClip, EditorProject, EditorTransition} from "./types";
 import {DEFAULT_CAPTION_STYLE, DEFAULT_TITLE_STYLE} from "./types";
+import {projectViewForSequence} from "./sequences";
 
 export type EditorCompositionProps = {
   project: EditorProject;
@@ -202,7 +203,7 @@ const VisualClip: React.FC<{clip: EditorClip; frameOffset: number; audioMultipli
   return <AbsoluteFill style={{overflow: "hidden", ...wrapperStyle}}>{content}{!offline && !maskedTreatment && <TreatmentOverlays clip={clip} localFrame={localFrame} />}</AbsoluteFill>;
 };
 
-export const EditorComposition: React.FC<EditorCompositionProps> = ({project}) => {
+const EditorTimeline: React.FC<EditorCompositionProps & {ancestors: string[]}> = ({project, ancestors}) => {
   const trackOrder = new Map(project.tracks.map((track, index) => [track.id, index]));
   const visibleClips = project.clips
     .filter((clip) => {
@@ -223,6 +224,17 @@ export const EditorComposition: React.FC<EditorCompositionProps> = ({project}) =
       {visibleClips.map((clip) => {
         const track = project.tracks.find((candidate) => candidate.id === clip.trackId);
         const sourceMedia = project.media?.find((item) => item.id === clip.sourceMediaId);
+        if (clip.kind === "sequence" && clip.nestedSequenceId && !ancestors.includes(clip.nestedSequenceId)) {
+          const nested = projectViewForSequence(project, clip.nestedSequenceId);
+          if (!nested) return null;
+          return (
+            <Sequence key={clip.id} from={clip.start} durationInFrames={clip.duration} premountFor={Math.min(project.fps, clip.duration)}>
+              <Sequence from={-Math.round(clip.sourceStart)} durationInFrames={nested.durationInFrames}>
+                <EditorTimeline project={nested} ancestors={[...ancestors, clip.nestedSequenceId]} />
+              </Sequence>
+            </Sequence>
+          );
+        }
         if (clip.kind === "audio") {
           if (!clip.src || sourceMedia?.offline) return null;
           const trackAudible = !track?.muted && (!audioSoloActive || Boolean(track?.solo));
@@ -266,3 +278,7 @@ export const EditorComposition: React.FC<EditorCompositionProps> = ({project}) =
     </AbsoluteFill>
   );
 };
+
+export const EditorComposition: React.FC<EditorCompositionProps> = ({project}) => (
+  <EditorTimeline project={project} ancestors={[project.activeSequenceId]} />
+);

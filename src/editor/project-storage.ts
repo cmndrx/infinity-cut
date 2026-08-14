@@ -1,11 +1,12 @@
 import {sampleProject} from "./project";
 import {normalizeFrameRate} from "./frame-rate";
-import type {EditorProject, EditorTrack} from "./types";
+import type {EditorProject, EditorSequence, EditorTrack} from "./types";
+import {syncActiveSequence} from "./sequences";
 import {DEFAULT_CAPTION_STYLE, DEFAULT_EFFECTS, DEFAULT_TITLE_STYLE} from "./types";
 
 export const PROJECT_LIBRARY_KEY = "infinity-cut-project-library-v2";
 export const LEGACY_PROJECT_KEY = "infinity-cut-project";
-export const PROJECT_SCHEMA_VERSION = 2;
+export const PROJECT_SCHEMA_VERSION = 3;
 
 const MAX_RECOVERY_VERSIONS = 8;
 const RECOVERY_INTERVAL_MS = 30_000;
@@ -64,7 +65,11 @@ const defaultTrack = (id: string, kind: EditorTrack["kind"]): EditorTrack => ({
   locked: false,
 });
 
-export const createBlankProject = ({name, width, height, fps}: NewProjectSettings): EditorProject => ({
+export const createBlankProject = ({name, width, height, fps}: NewProjectSettings): EditorProject => {
+  const activeSequenceId = "sequence-1";
+  const project: EditorProject = ({
+  activeSequenceId,
+  sequences: [],
   name: name.trim() || "Untitled Project",
   width,
   height,
@@ -87,11 +92,13 @@ export const createBlankProject = ({name, width, height, fps}: NewProjectSetting
     defaultTrack("a2", "audio"),
   ],
   clips: [],
-});
+  });
+  return syncActiveSequence(project);
+};
 
 export const normalizeProject = (value: unknown): EditorProject => {
   if (!value || typeof value !== "object") throw new Error("This is not a Directors Cut Pro project file");
-  const parsed = clone(value as EditorProject);
+  const parsed = clone(value as EditorProject & {sequences?: EditorSequence[]; activeSequenceId?: string});
   if (!Array.isArray(parsed.tracks) || !Array.isArray(parsed.clips) || !Number.isFinite(parsed.fps) || parsed.fps <= 0) {
     throw new Error("The project is missing its timeline data");
   }
@@ -132,7 +139,23 @@ export const normalizeProject = (value: unknown): EditorProject => {
         ? {...DEFAULT_CAPTION_STYLE, ...(clip.textStyle ?? {})}
         : clip.textStyle,
   }));
-  return parsed;
+  parsed.activeSequenceId = typeof parsed.activeSequenceId === "string" && parsed.activeSequenceId ? parsed.activeSequenceId : "sequence-1";
+  parsed.sequences = Array.isArray(parsed.sequences) ? parsed.sequences : [];
+  if (!parsed.sequences.some((sequence) => sequence.id === parsed.activeSequenceId)) {
+    parsed.sequences.push({
+      id: parsed.activeSequenceId,
+      name: "Sequence 01",
+      width: parsed.width,
+      height: parsed.height,
+      fps: parsed.fps,
+      durationInFrames: parsed.durationInFrames,
+      tracks: clone(parsed.tracks),
+      clips: clone(parsed.clips),
+      markers: clone(parsed.markers),
+      transitions: clone(parsed.transitions),
+    });
+  }
+  return syncActiveSequence(parsed);
 };
 
 const emptyLibrary = (): ProjectLibrary => ({
@@ -146,7 +169,7 @@ const readLibrary = (storage: StorageLike): ProjectLibrary => {
   if (!raw) return emptyLibrary();
   try {
     const parsed = JSON.parse(raw) as ProjectLibrary;
-    if (parsed.schemaVersion !== PROJECT_SCHEMA_VERSION || !Array.isArray(parsed.projects)) return emptyLibrary();
+    if (![2, PROJECT_SCHEMA_VERSION].includes(Number(parsed.schemaVersion)) || !Array.isArray(parsed.projects)) return emptyLibrary();
     return {
       schemaVersion: PROJECT_SCHEMA_VERSION,
       activeProjectId: typeof parsed.activeProjectId === "string" ? parsed.activeProjectId : null,

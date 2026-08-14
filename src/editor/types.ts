@@ -1,4 +1,4 @@
-export type MediaKind = "video" | "image" | "audio" | "title" | "caption";
+export type MediaKind = "video" | "image" | "audio" | "title" | "caption" | "sequence";
 
 export type TextStyle = {
   fontFamily: string;
@@ -123,6 +123,7 @@ export type EditorClip = {
   textStyle?: TextStyle;
   linkedGroupId?: string;
   sourceMediaId?: string;
+  nestedSequenceId?: string;
 };
 
 export type MediaBin = {
@@ -181,6 +182,21 @@ export type EditorProject = {
   transitions: EditorTransition[];
   mediaBins: MediaBin[];
   media: ProjectMedia[];
+  activeSequenceId: string;
+  sequences: EditorSequence[];
+};
+
+export type EditorSequence = {
+  id: string;
+  name: string;
+  width: number;
+  height: number;
+  fps: number;
+  durationInFrames: number;
+  tracks: EditorTrack[];
+  clips: EditorClip[];
+  markers: EditorMarker[];
+  transitions: EditorTransition[];
 };
 
 export const DEFAULT_TRANSFORM: Transform = {

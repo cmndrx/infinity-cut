@@ -2,6 +2,8 @@ import type {EditorProject, ProjectMedia} from "./types";
 import {DEFAULT_EFFECTS, DEFAULT_TITLE_STYLE, DEFAULT_TRANSFORM} from "./types";
 
 export const sampleProject: EditorProject = {
+  activeSequenceId: "sequence-1",
+  sequences: [],
   name: "Game Library Launch",
   width: 1920,
   height: 1080,

@@ -396,6 +396,18 @@ describe("timeline commands", () => {
     expect(result.project.clips.find((item) => item.id === "insert-media-1")).toMatchObject({start: 20, duration: 10, sourceMediaId: "media"});
   });
 
+  it("uses explicit multi-track targets for insert ripple and rejects source overruns", () => {
+    const value = project();
+    value.media = [{id: "media", name: "Media", kind: "video", src: "/media.mp4", duration: 20, color: "#09f", binId: "bin-video"}];
+    value.clips = [clip({id: "v1-later", start: 30, duration: 10}), clip({id: "v2-later", trackId: "v2", start: 30, duration: 10}), clip({id: "v3-later", trackId: "v3", start: 30, duration: 10})];
+    const result = successful(placeMedia(value, {mode: "insert", atFrame: 20, items: [{mediaId: "media", trackId: "v1", sourceStart: 5, duration: 10}], rippleTrackIds: ["v1", "v2"], idBase: "three-point"}));
+    expect(result.project.clips.find((item) => item.id === "v1-later")?.start).toBe(40);
+    expect(result.project.clips.find((item) => item.id === "v2-later")?.start).toBe(40);
+    expect(result.project.clips.find((item) => item.id === "v3-later")?.start).toBe(30);
+    expect(result.project.clips.find((item) => item.id === "three-point-media-1")).toMatchObject({sourceStart: 5, duration: 10});
+    expect(placeMedia(value, {mode: "overwrite", atFrame: 0, items: [{mediaId: "media", trackId: "v1", sourceStart: 15, duration: 10}], idBase: "bad-range"})).toMatchObject({ok: false, error: {code: "INVALID_SOURCE_RANGE"}});
+  });
+
   it("overwrite placement resolves spanning and right-edge intersections", () => {
     const spanning = project();
     spanning.media = [{id: "media", name: "Media", kind: "video", src: "/media.mp4", duration: 10, color: "#09f", binId: "bin-video"}];

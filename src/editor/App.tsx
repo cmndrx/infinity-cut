@@ -1,4 +1,4 @@
-/* eslint-disable @remotion/non-pure-animation -- Editor UI state is interactive and is not rendered as a Remotion composition. */
+/* eslint-disable @remotion/non-pure-animation, @remotion/warn-native-media-tag -- Editor UI state and native source monitor media are interactive and are not rendered as a Remotion composition. */
 import React, {useCallback, useEffect, useMemo, useRef, useState} from "react";
 import {Player, type PlayerRef} from "@remotion/player";
 import {
@@ -70,6 +70,7 @@ import {getClipPlaybackRate, getClipSourceSpan, MAX_PLAYBACK_RATE, MIN_PLAYBACK_
 import {cloneClips, moveClips, placeMedia, retimeClip, rippleDelete, splitClip, trimClip, type CommandResult} from "./core";
 import {conformMediaToFrameRate, formatFrameRate, frameRatesMatch, normalizeFrameRate, retimeProjectForFrameRate} from "./frame-rate";
 import {createProjectFile, normalizeProject, saveStoredProject} from "./project-storage";
+import {canNestSequence, createSequence, switchActiveSequence, syncActiveSequence} from "./sequences";
 import type {EditorClip, EditorProject, EditorTrack, EditorTransition, KeyframeProperty, MediaKind, ProjectMedia, TextStyle, TransitionType} from "./types";
 import {DEFAULT_CAPTION_STYLE, DEFAULT_EFFECTS, DEFAULT_TITLE_STYLE, DEFAULT_TRANSFORM} from "./types";
 
@@ -281,6 +282,11 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
     audio: initialProject.tracks.find((track) => track.id === "a1")?.id ?? initialProject.tracks.find((track) => track.kind === "audio")?.id ?? "",
     caption: initialProject.tracks.find((track) => track.kind === "caption")?.id ?? "",
   }));
+  const [targetedTrackIds, setTargetedTrackIds] = useState<string[]>(() => initialProject.tracks.filter((track) => !track.locked).map((track) => track.id));
+  const [monitorMode, setMonitorMode] = useState<"source" | "program">("program");
+  const [sourceFrame, setSourceFrame] = useState(0);
+  const [sourcePlaying, setSourcePlaying] = useState(false);
+  const [sourceRanges, setSourceRanges] = useState<Record<string, {inFrame: number; outFrame: number}>>({});
   const [frame, setFrame] = useState(105);
   const [isPlaying, setIsPlaying] = useState(false);
   const [zoom, setZoom] = useState(1.45);
@@ -315,6 +321,7 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
   const [frameRateMismatch, setFrameRateMismatch] = useState<FrameRateMismatch | null>(null);
   const [speedDialog, setSpeedDialog] = useState<SpeedDialogState | null>(null);
   const playerRef = useRef<PlayerRef>(null);
+  const sourceMediaRef = useRef<HTMLVideoElement | HTMLAudioElement>(null);
   const initialFrameRef = useRef(frame);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const mediaActionInputRef = useRef<HTMLInputElement>(null);
@@ -335,7 +342,7 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
     if (drag) return;
     const timeout = window.setTimeout(() => {
       try {
-        saveStoredProject(projectId, project);
+        saveStoredProject(projectId, syncActiveSequence(project));
         setToast("Autosaved just now");
       } catch (error) {
         setToast(error instanceof Error ? error.message : "Autosave failed");
@@ -347,7 +354,7 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
   useEffect(() => {
     const saveBeforeClose = () => {
       try {
-        saveStoredProject(projectId, dragOriginProjectRef.current ?? projectRef.current);
+        saveStoredProject(projectId, syncActiveSequence(dragOriginProjectRef.current ?? projectRef.current));
       } catch {
         // The visible autosave status reports storage failures during normal editing.
       }
@@ -368,6 +375,10 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
       }
       return changed ? next : current;
     });
+  }, [project.tracks]);
+
+  useEffect(() => {
+    setTargetedTrackIds((current) => current.filter((id) => project.tracks.some((track) => track.id === id)));
   }, [project.tracks]);
 
   const pixelsPerFrame = zoom * 1.35;
@@ -728,13 +739,13 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
       return null;
     }
     const safeStart = Math.max(0, Math.round(start));
-    const result = placeMedia(project, {mode: editMode, atFrame: safeStart, items: [{mediaId: item.id, trackId: targetTrack}], idBase: "media"});
+    const result = placeMedia(project, {mode: editMode, atFrame: safeStart, items: [{mediaId: item.id, trackId: targetTrack}], rippleTrackIds: editMode === "insert" ? targetedTrackIds : undefined, idBase: "media"});
     if (!applyKernelResult(result, message ? `${editMode === "insert" ? "Inserted" : "Overwrote with"} ${item.name} on ${track.name}` : "Media placement applied")) return null;
     if (!result.ok) return null;
     const id = result.createdClipIds.find((clipId) => result.project.clips.some((clip) => clip.id === clipId && clip.sourceMediaId === item.id)) ?? result.createdClipIds[0];
     if (id) setSelectedClipIds([id]);
     return id ?? null;
-  }, [applyKernelResult, editMode, project]);
+  }, [applyKernelResult, editMode, project, targetedTrackIds]);
 
   const addMediaToTimeline = useCallback((item: MediaItem) => {
     const kind = clipTrackKind(item.kind);
@@ -924,7 +935,9 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
         openSpeedDialog();
       } else if (event.key === " " || event.code === "Space") {
         event.preventDefault();
-        togglePlayback();
+        if (monitorMode === "source" && sourceMediaRef.current) {
+          if (sourceMediaRef.current.paused) void sourceMediaRef.current.play(); else sourceMediaRef.current.pause();
+        } else togglePlayback();
       } else if (event.key.toLowerCase() === "s") {
         event.preventDefault();
         splitSelected();
@@ -959,7 +972,7 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
     };
     window.addEventListener("keydown", keydown);
     return () => window.removeEventListener("keydown", keydown);
-  }, [addMarker, copySelected, deleteSelected, deleteSelectedTransition, duplicateSelected, frame, openSpeedDialog, pasteClips, project.fps, redo, rippleDeleteSelected, seek, selectedTransitionId, splitSelected, togglePlayback, undo]);
+  }, [addMarker, copySelected, deleteSelected, deleteSelectedTransition, duplicateSelected, frame, monitorMode, openSpeedDialog, pasteClips, project.fps, redo, rippleDeleteSelected, seek, selectedTransitionId, splitSelected, togglePlayback, undo]);
 
   useEffect(() => {
     const isFileDrag = (event: DragEvent) => Array.from(event.dataTransfer?.types ?? []).includes("Files");
@@ -1259,6 +1272,140 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
     return counts;
   }, {}), [project.clips]);
   const selectedMedia = project.media.find((item) => item.id === selectedMediaId) ?? null;
+  const activeSequence = project.sequences.find((sequence) => sequence.id === project.activeSequenceId);
+  const sourceRange = useMemo(() => selectedMedia ? (sourceRanges[selectedMedia.id] ?? {inFrame: 0, outFrame: selectedMedia.duration}) : null, [selectedMedia, sourceRanges]);
+  const openInSourceMonitor = useCallback((item: ProjectMedia) => {
+    setSelectedMediaId(item.id);
+    setSourceFrame(sourceRanges[item.id]?.inFrame ?? 0);
+    setSourcePlaying(false);
+    setMonitorMode("source");
+  }, [sourceRanges]);
+  const seekSource = useCallback((nextFrame: number) => {
+    if (!selectedMedia) return;
+    const bounded = clamp(Math.round(nextFrame), 0, Math.max(0, selectedMedia.duration - 1));
+    setSourceFrame(bounded);
+    if (sourceMediaRef.current) sourceMediaRef.current.currentTime = bounded / project.fps;
+  }, [project.fps, selectedMedia]);
+  const setSourcePoint = useCallback((edge: "inFrame" | "outFrame") => {
+    if (!selectedMedia) return;
+    setSourceRanges((current) => {
+      const range = current[selectedMedia.id] ?? {inFrame: 0, outFrame: selectedMedia.duration};
+      const next = edge === "inFrame"
+        ? {...range, inFrame: Math.min(sourceFrame, range.outFrame - 2)}
+        : {...range, outFrame: Math.max(sourceFrame + 1, range.inFrame + 2)};
+      return {...current, [selectedMedia.id]: next};
+    });
+    setToast(`Marked source ${edge === "inFrame" ? "In" : "Out"}`);
+  }, [selectedMedia, sourceFrame]);
+  const performThreePointEdit = useCallback((mode: EditMode) => {
+    if (!selectedMedia || !sourceRange) {
+      setToast("Open a clip in the Source Monitor first");
+      return;
+    }
+    const kind = clipTrackKind(selectedMedia.kind);
+    const trackId = destinationRoutes[kind];
+    const track = project.tracks.find((candidate) => candidate.id === trackId);
+    if (!track || track.locked) {
+      setToast(track?.locked ? `${track.name} is locked` : `Patch the source to a ${kind} track`);
+      return;
+    }
+    const duration = sourceRange.outFrame - sourceRange.inFrame;
+    const result = placeMedia(project, {
+      mode,
+      atFrame: frame,
+      items: [{mediaId: selectedMedia.id, trackId, duration, sourceStart: sourceRange.inFrame}],
+      rippleTrackIds: mode === "insert" ? targetedTrackIds : undefined,
+      idBase: `three-point-${Date.now()}`,
+    });
+    if (applyKernelResult(result, `${mode === "insert" ? "Inserted" : "Overwrote with"} ${selectedMedia.name} · ${formatTimecode(duration, project.fps)}`) && result.ok) {
+      setSelectedClipIds(result.createdClipIds.slice(0, 1));
+      setMonitorMode("program");
+    }
+  }, [applyKernelResult, destinationRoutes, frame, project, selectedMedia, sourceRange, targetedTrackIds]);
+  const changeSequence = useCallback((sequenceId: string) => {
+    try {
+      const next = switchActiveSequence(project, sequenceId);
+      setPast((items) => [...items.slice(-49), cloneProject(project)]);
+      setFuture([]);
+      setProject(next);
+      setSelectedClipIds([]);
+      setSelectedTransitionId(null);
+      setFrame(0);
+      setToast(`Opened ${next.sequences.find((sequence) => sequence.id === sequenceId)?.name ?? "sequence"}`);
+    } catch (error) {
+      setToast(error instanceof Error ? error.message : "Sequence could not be opened");
+    }
+  }, [project]);
+  const addSequence = useCallback(() => {
+    const nextSequence = createSequence(project);
+    const withSequence = syncActiveSequence({...project, sequences: [...project.sequences, nextSequence]});
+    setPast((items) => [...items.slice(-49), cloneProject(project)]);
+    setFuture([]);
+    setProject(switchActiveSequence(withSequence, nextSequence.id));
+    setSelectedClipIds([]);
+    setFrame(0);
+    setToast(`Created ${nextSequence.name}`);
+  }, [project]);
+  const duplicateSequence = useCallback(() => {
+    const synced = syncActiveSequence(project);
+    const source = synced.sequences.find((sequence) => sequence.id === synced.activeSequenceId);
+    if (!source) return;
+    const duplicate = structuredClone(source);
+    duplicate.id = `sequence-${Date.now()}-copy`;
+    duplicate.name = `${source.name} Copy`;
+    const next = switchActiveSequence({...synced, sequences: [...synced.sequences, duplicate]}, duplicate.id);
+    setPast((items) => [...items.slice(-49), cloneProject(project)]);
+    setFuture([]);
+    setProject(next);
+    setSelectedClipIds([]);
+    setFrame(0);
+    setToast(`Duplicated ${source.name}`);
+  }, [project]);
+  const nestSequence = useCallback((sequenceId: string) => {
+    const source = syncActiveSequence(project).sequences.find((sequence) => sequence.id === sequenceId);
+    const trackId = destinationRoutes.video;
+    const track = project.tracks.find((candidate) => candidate.id === trackId && candidate.kind === "video");
+    if (!source || !canNestSequence(project, sequenceId)) {
+      setToast("That sequence would create a nesting loop");
+      return;
+    }
+    if (!track || track.locked) {
+      setToast(track?.locked ? `${track.name} is locked` : "Patch a video destination before nesting");
+      return;
+    }
+    const duration = Math.min(source.durationInFrames, project.durationInFrames - frame);
+    if (project.clips.some((clip) => clip.trackId === track.id && clip.start < frame + duration && clip.start + clip.duration > frame)) {
+      setToast(`${track.name} has media in the nested sequence range`);
+      return;
+    }
+    const id = `nested-${Date.now()}`;
+    commit((draft) => draft.clips.push({
+      id, name: source.name, kind: "sequence", nestedSequenceId: source.id, trackId: track.id, start: frame, duration,
+      sourceStart: 0, color: "#7f68d9", volume: 1, fadeIn: 0, fadeOut: 0, audioMuted: false,
+      transform: {...DEFAULT_TRANSFORM}, effects: {...DEFAULT_EFFECTS}, keyframes: [],
+    }), `Nested ${source.name} on ${track.name}`);
+    setSelectedClipIds([id]);
+  }, [commit, destinationRoutes.video, frame, project]);
+  useEffect(() => {
+    const onSourceShortcut = (event: KeyboardEvent) => {
+      if (monitorMode !== "source" || ["INPUT", "TEXTAREA", "SELECT"].includes((event.target as HTMLElement).tagName)) return;
+      if (event.key.toLowerCase() === "i") {
+        event.preventDefault();
+        setSourcePoint("inFrame");
+      } else if (event.key.toLowerCase() === "o") {
+        event.preventDefault();
+        setSourcePoint("outFrame");
+      } else if (event.key === ",") {
+        event.preventDefault();
+        performThreePointEdit("insert");
+      } else if (event.key === ".") {
+        event.preventDefault();
+        performThreePointEdit("overwrite");
+      }
+    };
+    window.addEventListener("keydown", onSourceShortcut);
+    return () => window.removeEventListener("keydown", onSourceShortcut);
+  }, [monitorMode, performThreePointEdit, setSourcePoint]);
   const filteredMedia = useMemo(() => project.media
     .filter((item) => activeBinId === "all" || item.binId === activeBinId)
     .filter((item) => mediaKindFilter === "all" || item.kind === mediaKindFilter)
@@ -1547,7 +1694,7 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
 
   const saveProject = () => {
     try {
-      saveStoredProject(projectId, project, {manual: true});
+      saveStoredProject(projectId, syncActiveSequence(project), {manual: true});
       setToast("Project saved locally");
     } catch (error) {
       setToast(error instanceof Error ? error.message : "Project could not be saved");
@@ -1555,7 +1702,7 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
   };
 
   const exportProjectFile = () => {
-    const blob = new Blob([JSON.stringify(createProjectFile(project), null, 2)], {type: "application/json"});
+    const blob = new Blob([JSON.stringify(createProjectFile(syncActiveSequence(project)), null, 2)], {type: "application/json"});
     const url = URL.createObjectURL(blob);
     const anchor = document.createElement("a");
     anchor.href = url;
@@ -1587,7 +1734,7 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
       const response = await fetch("/api/render", {
         method: "POST",
         headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({project, format: exportFormat, quality: exportQuality, resolution: exportResolution, frameRange}),
+        body: JSON.stringify({project: syncActiveSequence(project), format: exportFormat, quality: exportQuality, resolution: exportResolution, frameRange}),
       });
       const result = await response.json() as RenderJobStatus & {error?: string};
       if (!response.ok) throw new Error(result.error ?? "The render service rejected the export");
@@ -2137,11 +2284,10 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
                       binPointerDragRef.current = next;
                       setBinPointerDrag(next);
                     }}
-                    onDoubleClick={() => addMediaToTimeline(item)}
-                    title="Drag to a timeline track or double-click to add at playhead"
+                    onDoubleClick={() => openInSourceMonitor(item)}
+                    title="Drag to a timeline track or double-click to open in Source Monitor"
                   >
                     <div className="media-thumb" style={{"--media-color": item.color} as React.CSSProperties}>
-                      {/* eslint-disable-next-line @remotion/warn-native-media-tag -- This thumbnail is editor chrome, not rendered video. */}
                       {item.kind === "image" && !item.offline ? <img src={item.src} alt="" /> : clipIcon(item.kind, mediaView === "grid" ? 25 : 15)}
                       {item.offline && <b>OFFLINE</b>}
                       <span>{formatTimecode(item.duration, project.fps).slice(3)}</span>
@@ -2300,9 +2446,39 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
         </section>
 
         <section className="program-panel panel">
-          <div className="panel-heading"><span>Program: {project.name}</span><div><button>Fit <ChevronDown size={12} /></button><button><Settings2 size={14} /></button></div></div>
+          <div className="monitor-heading">
+            <div className="monitor-tabs">
+              <button className={monitorMode === "source" ? "active" : ""} disabled={!selectedMedia} onClick={() => selectedMedia && setMonitorMode("source")}>Source{selectedMedia ? `: ${selectedMedia.name}` : ""}</button>
+              <button className={monitorMode === "program" ? "active" : ""} onClick={() => setMonitorMode("program")}>Program: {activeSequence?.name ?? "Sequence"}</button>
+            </div>
+            <div><button>Fit <ChevronDown size={12} /></button><button><Settings2 size={14} /></button></div>
+          </div>
           <div className="program-stage">
-            <div className="player-frame">
+            {monitorMode === "source" && selectedMedia ? <div className="source-monitor-frame">
+              {selectedMedia.kind === "video" ? <video
+                key={selectedMedia.id}
+                ref={(node) => {sourceMediaRef.current = node;}}
+                src={selectedMedia.src}
+                onPlay={() => setSourcePlaying(true)}
+                onPause={() => setSourcePlaying(false)}
+                onTimeUpdate={(event) => {
+                  const next = Math.round(event.currentTarget.currentTime * project.fps);
+                  setSourceFrame(next);
+                  if (sourceRange && next >= sourceRange.outFrame) {event.currentTarget.pause(); seekSource(sourceRange.inFrame);}
+                }}
+              /> : selectedMedia.kind === "audio" ? <div className="source-audio-preview"><AudioWaveform size={46} /><strong>{selectedMedia.name}</strong><small>Audio source</small><audio
+                key={selectedMedia.id}
+                ref={(node) => {sourceMediaRef.current = node;}}
+                src={selectedMedia.src}
+                onPlay={() => setSourcePlaying(true)}
+                onPause={() => setSourcePlaying(false)}
+                onTimeUpdate={(event) => {
+                  const next = Math.round(event.currentTarget.currentTime * project.fps);
+                  setSourceFrame(next);
+                  if (sourceRange && next >= sourceRange.outFrame) {event.currentTarget.pause(); seekSource(sourceRange.inFrame);}
+                }}
+              /></div> : <img src={selectedMedia.src} alt={selectedMedia.name} />}
+            </div> : <div className="player-frame">
               <Player
                 ref={playerRef}
                 component={EditorComposition}
@@ -2318,9 +2494,25 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
                 acknowledgeRemotionLicense
                 style={{width: "100%", height: "100%"}}
               />
-            </div>
+            </div>}
           </div>
-          <div className="transport">
+          {monitorMode === "source" && selectedMedia && sourceRange ? <div className="source-transport">
+            <div className="source-range-bar">
+              <div className="source-range-selection" style={{left: `${(sourceRange.inFrame / selectedMedia.duration) * 100}%`, width: `${((sourceRange.outFrame - sourceRange.inFrame) / selectedMedia.duration) * 100}%`}} />
+              <input aria-label="Source playhead" type="range" min={0} max={Math.max(1, selectedMedia.duration - 1)} value={sourceFrame} onChange={(event) => seekSource(Number(event.target.value))} />
+            </div>
+            <div className="source-controls">
+              <span className="timecode primary">{formatTimecode(sourceFrame, project.fps)}</span>
+              <button onClick={() => setSourcePoint("inFrame")} title="Mark In (I)">Mark In <kbd>I</kbd></button>
+              <button onClick={() => seekSource(sourceFrame - 1)}><ChevronRight className="flip" size={15} /></button>
+              <button className="play-button" onClick={() => {if (selectedMedia.kind === "image") return; if (sourceMediaRef.current?.paused) void sourceMediaRef.current.play(); else sourceMediaRef.current?.pause();}}>{sourcePlaying ? <Pause size={16} fill="currentColor" /> : <Play size={16} fill="currentColor" />}</button>
+              <button onClick={() => seekSource(sourceFrame + 1)}><ChevronRight size={15} /></button>
+              <button onClick={() => setSourcePoint("outFrame")} title="Mark Out (O)">Mark Out <kbd>O</kbd></button>
+              <button className="source-edit insert" onClick={() => performThreePointEdit("insert")} title="Insert edit (,)">Insert <kbd>,</kbd></button>
+              <button className="source-edit overwrite" onClick={() => performThreePointEdit("overwrite")} title="Overwrite edit (.)">Overwrite <kbd>.</kbd></button>
+              <span className="source-range-time">{formatTimecode(sourceRange.outFrame - sourceRange.inFrame, project.fps)}</span>
+            </div>
+          </div> : <div className="transport">
             <div className="timecode primary">{formatTimecode(frame, project.fps)}</div>
             <div className="transport-controls">
               <button onClick={() => seek(frame - project.fps)} title="Previous second"><StepBack size={16} /></button>
@@ -2330,7 +2522,7 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
               <button onClick={() => seek(frame + project.fps)} title="Next second"><StepForward size={16} /></button>
             </div>
             <div className="timecode">{formatTimecode(project.durationInFrames, project.fps)}</div>
-          </div>
+          </div>}
         </section>
 
         <aside className="inspector-panel panel">
@@ -2447,16 +2639,25 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
                 <button aria-pressed={editMode === "overwrite"} className={editMode === "overwrite" ? "active" : ""} onClick={() => setEditMode("overwrite")} title="Overwrite edit: replace material in range">Overwrite</button>
               </div>
             </div>
-            <div className="sequence-title"><Layers3 size={14} /> Sequence 01 <span>{selectedClipIds.length ? `${selectedClipIds.length} selected` : `${project.width} × ${project.height} · ${formatFrameRate(project.fps)} fps`}</span></div>
+            <div className="sequence-title"><Layers3 size={14} />
+              <select aria-label="Active sequence" value={project.activeSequenceId} onChange={(event) => changeSequence(event.target.value)}>{project.sequences.map((sequence) => <option key={sequence.id} value={sequence.id}>{sequence.name}</option>)}</select>
+              <button onClick={addSequence} title="New sequence"><Plus size={12} /> New</button>
+              <button onClick={duplicateSequence} title="Duplicate active sequence"><Copy size={12} /> Duplicate</button>
+              <select aria-label="Nest sequence at playhead" value="" onChange={(event) => {if (event.target.value) nestSequence(event.target.value);}}>
+                <option value="">Nest…</option>
+                {project.sequences.filter((sequence) => canNestSequence(project, sequence.id)).map((sequence) => <option key={sequence.id} value={sequence.id}>{sequence.name}</option>)}
+              </select>
+              <span>{selectedClipIds.length ? `${selectedClipIds.length} selected` : `${project.width} × ${project.height} · ${formatFrameRate(project.fps)} fps`}</span>
+            </div>
             <div className="zoom-control"><ZoomOut size={14} /><input type="range" min="0.55" max="3.4" step="0.05" value={zoom} onChange={(event) => setZoom(Number(event.target.value))} /><ZoomIn size={14} /></div>
           </div>
           <div className="timeline-body">
             <div className="track-headers">
-              <div className="track-routing-header" title="Incoming media destination"><span>Destination</span></div>
+              <div className="track-routing-header" title="Source patch and edit targets"><span>Patch</span><span>Target</span></div>
               {project.tracks.map((track) => (
                 <div className={`track-header ${track.kind} ${track.locked ? "locked" : ""}`} key={track.id}>
                   <button aria-label={`Route incoming ${track.kind} media to ${track.name}`} aria-pressed={destinationRoutes[track.kind] === track.id} className={destinationRoutes[track.kind] === track.id ? "destination-route active" : "destination-route"} onClick={() => setDestinationRoutes((current) => ({...current, [track.kind]: track.id}))} title={track.locked ? `${track.name} is locked · unlock to use as a destination` : `Route incoming ${track.kind} media to ${track.name}`}>{track.name}</button>
-                  <span aria-hidden="true" />
+                  <button aria-label={`Target ${track.name} for timeline edits`} aria-pressed={targetedTrackIds.includes(track.id)} className={targetedTrackIds.includes(track.id) ? "track-target active" : "track-target"} onClick={() => setTargetedTrackIds((current) => current.includes(track.id) ? current.filter((id) => id !== track.id) : [...current, track.id])} title={`${targetedTrackIds.includes(track.id) ? "Remove" : "Add"} ${track.name} ${targetedTrackIds.includes(track.id) ? "from" : "to"} edit targets`}>T</button>
                   <button onClick={() => toggleTrack(track.id, "locked")}>{track.locked ? <Lock size={12} /> : <Unlock size={12} />}</button>
                   {track.kind !== "audio" ? <button onClick={() => toggleTrack(track.id, "hidden")}>{track.hidden ? <EyeOff size={13} /> : <Eye size={13} />}</button> : <><button className={track.solo ? "track-solo active" : "track-solo"} onClick={() => toggleTrack(track.id, "solo")} title={`Solo ${track.name}`}>S</button><button onClick={() => toggleTrack(track.id, "muted")} title={`Mute ${track.name}`}>{track.muted ? <VolumeX size={13} /> : <Volume2 size={13} />}</button></>}
                 </div>

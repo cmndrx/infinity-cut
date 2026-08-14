@@ -700,7 +700,7 @@ const executePlaceMedia = (project: EditorProject, command: PlaceMediaCommand): 
     const sourceStart = item.sourceStart ?? 0;
     if (duration < MIN_CLIP_DURATION) return failure(project, {code: "INVALID_DURATION", message: `${media.name} must be at least ${MIN_CLIP_DURATION} frames`, entityId: media.id});
     if (!Number.isInteger(offsetFrames) || command.atFrame + offsetFrames < 0) return failure(project, {code: "INVALID_FRAME", message: `${media.name} has an invalid placement offset`, entityId: media.id});
-    if (!Number.isFinite(sourceStart) || sourceStart < 0) return failure(project, {code: "INVALID_SOURCE_RANGE", message: `${media.name} has an invalid source start`, entityId: media.id});
+    if (!Number.isFinite(sourceStart) || sourceStart < 0 || sourceStart + duration > media.duration) return failure(project, {code: "INVALID_SOURCE_RANGE", message: `${media.name} has an invalid source range`, entityId: media.id});
     let linkedGroupId: string | undefined;
     if (item.linkedKey) {
       linkedGroupId = linkedGroups.get(item.linkedKey);
@@ -889,7 +889,7 @@ const isTextStylePayload = (value: unknown) => isRecord(value)
 const isClipCommandPayload = (value: unknown): value is EditorClip => isRecord(value)
   && isJsonSerializable(value)
   && typeof value.id === "string" && typeof value.name === "string" && typeof value.trackId === "string"
-  && typeof value.kind === "string" && ["video", "image", "audio", "title", "caption"].includes(value.kind)
+  && typeof value.kind === "string" && ["video", "image", "audio", "title", "caption", "sequence"].includes(value.kind)
   && Number.isInteger(value.start) && Number.isInteger(value.duration) && isFiniteNumber(value.sourceStart)
   && typeof value.color === "string" && isFiniteNumber(value.volume)
   && Number.isInteger(value.fadeIn) && Number.isInteger(value.fadeOut) && typeof value.audioMuted === "boolean"
@@ -901,7 +901,8 @@ const isClipCommandPayload = (value: unknown): value is EditorClip => isRecord(v
   && (value.playbackRate === undefined || isFiniteNumber(value.playbackRate))
   && (value.preservePitch === undefined || typeof value.preservePitch === "boolean")
   && (value.linkedGroupId === undefined || typeof value.linkedGroupId === "string")
-  && (value.sourceMediaId === undefined || typeof value.sourceMediaId === "string");
+  && (value.sourceMediaId === undefined || typeof value.sourceMediaId === "string")
+  && (value.nestedSequenceId === undefined || typeof value.nestedSequenceId === "string");
 const isTransitionCommandPayload = (value: unknown) => isRecord(value) && typeof value.id === "string"
   && typeof value.fromClipId === "string" && typeof value.toClipId === "string"
   && typeof value.type === "string" && ["cross-dissolve", "dip-to-black", "wipe-left", "slide-left"].includes(value.type)

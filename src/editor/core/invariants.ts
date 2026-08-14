@@ -36,8 +36,8 @@ export type ProjectValidation = {
   issues: TimelineIssue[];
 };
 
-const visualKinds: ReadonlySet<MediaKind> = new Set(["video", "image", "title"]);
-const clipKinds: ReadonlySet<MediaKind> = new Set(["video", "image", "audio", "title", "caption"]);
+const visualKinds: ReadonlySet<MediaKind> = new Set(["video", "image", "title", "sequence"]);
+const clipKinds: ReadonlySet<MediaKind> = new Set(["video", "image", "audio", "title", "caption", "sequence"]);
 const trackKinds = new Set(["video", "audio", "caption"]);
 const transitionTypes: ReadonlySet<TransitionType> = new Set(["cross-dissolve", "dip-to-black", "wipe-left", "slide-left"]);
 const keyframeProperties: ReadonlySet<KeyframeProperty> = new Set([
@@ -167,6 +167,9 @@ export const validateProjectInvariants = (project: EditorProject): ProjectValida
     }
     if (clip.sourceMediaId !== undefined && (!isEntityId(clip.sourceMediaId) || !mediaIds.has(clip.sourceMediaId))) {
       issues.push({code: "INVALID_MEDIA_REFERENCE", message: `Clip ${String(clip.id)} references missing source media`, entityId: String(clip.id), path: "clips.sourceMediaId"});
+    }
+    if (clip.kind === "sequence" && (!isEntityId(clip.nestedSequenceId) || !project.sequences?.some((sequence) => sequence.id === clip.nestedSequenceId))) {
+      issues.push({code: "INVALID_MEDIA_REFERENCE", message: `Clip ${String(clip.id)} references a missing sequence`, entityId: String(clip.id), path: "clips.nestedSequenceId"});
     }
     if (!Number.isInteger(clip.start) || clip.start < 0 || !Number.isFinite(clip.sourceStart) || clip.sourceStart < 0
       || !Number.isInteger(clip.duration) || clip.duration < MIN_CLIP_DURATION || clip.start + clip.duration > project.durationInFrames) {
