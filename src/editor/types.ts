@@ -1,3 +1,7 @@
+import type {AudioBus, AudioProcessor} from "./audio/model";
+import type {VisualEffectInstance} from "./effects/registry";
+import type {ObjectMatteReference} from "./mattes/object-matte";
+
 export type MediaKind = "video" | "image" | "audio" | "title" | "caption" | "sequence";
 
 export type TextStyle = {
@@ -202,12 +206,16 @@ export type EditorClip = {
   fadeIn: number;
   fadeOut: number;
   audioMuted: boolean;
+  audioPan?: number;
+  audioProcessors?: AudioProcessor[];
   playbackRate?: number;
   preservePitch?: boolean;
   transform: Transform;
   effects: Effects;
   colorGrade?: ColorGrade;
   effectMasks?: EditorEffectMask[];
+  visualEffects?: VisualEffectInstance[];
+  objectMattes?: ObjectMatteReference[];
   keyframes: ClipKeyframe[];
   text?: string;
   textStyle?: TextStyle;
@@ -256,8 +264,17 @@ export type EditorTrack = {
   muted: boolean;
   solo: boolean;
   volume: number;
+  audioPan?: number;
+  audioBusId?: string;
+  audioProcessors?: AudioProcessor[];
   hidden: boolean;
   locked: boolean;
+};
+
+export type ProjectAudioSettings = {
+  sampleRate: number;
+  masterBusId: string;
+  buses: AudioBus[];
 };
 
 export type EditorProject = {
@@ -273,6 +290,7 @@ export type EditorProject = {
   mediaBins: MediaBin[];
   media: ProjectMedia[];
   luts?: ProjectLut[];
+  audioSettings?: ProjectAudioSettings;
   activeSequenceId: string;
   sequences: EditorSequence[];
 };

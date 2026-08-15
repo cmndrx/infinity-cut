@@ -1,31 +1,21 @@
 import {createReadStream, createWriteStream} from "node:fs";
-import {mkdir, stat, unlink} from "node:fs/promises";
+import {mkdir, readdir, rm, stat, unlink} from "node:fs/promises";
 import {randomUUID} from "node:crypto";
 import path from "node:path";
 import {pipeline} from "node:stream/promises";
+import {spawn} from "node:child_process";
 import {bundle} from "@remotion/bundler";
-import {makeCancelSignal, renderMedia, selectComposition, type AudioCodec, type Codec, type PixelFormat} from "@remotion/renderer";
+import {makeCancelSignal, renderFrames, renderMedia, selectComposition, type AudioCodec, type Codec, type PixelFormat} from "@remotion/renderer";
 import type {Connect, Plugin} from "vite";
+import {PersistentExportQueue, type StoredExportJob} from "./server/export-queue";
+import {writeStoredZip} from "./server/zip";
 import type {EditorProject} from "./src/editor/types";
+import {buildProjectAudioMix} from "./src/editor/audio/project-audio";
+import {buildFfmpegAudioGraph} from "./src/editor/audio/ffmpeg-filter-graph";
 
-export type RenderFormat = "mp4" | "webm" | "hevc" | "prores";
+export type RenderFormat = "mp4" | "webm" | "hevc" | "prores" | "png-sequence" | "jpeg-sequence" | "wav" | "audio-stems";
 export type RenderQuality = "draft" | "standard" | "high";
 type RenderResolution = "source" | "720p";
-type RenderStage = "queued" | "bundling" | "rendering" | "complete" | "cancelled" | "error";
-
-type RenderJob = {
-  id: string;
-  stage: RenderStage;
-  progress: number;
-  message: string;
-  filename: string;
-  outputPath: string;
-  createdAt: number;
-  sizeBytes?: number;
-  error?: string;
-  cancel?: () => void;
-};
-
 type RenderRequest = {
   project: EditorProject;
   format?: RenderFormat;
@@ -89,51 +79,105 @@ const contentTypeFor = (filename: string) => {
     ".jpg": "image/jpeg",
     ".jpeg": "image/jpeg",
     ".webp": "image/webp",
+    ".zip": "application/zip",
   } as Record<string, string>)[extension] ?? "application/octet-stream";
 };
 
-const publicJob = (job: RenderJob) => ({
+const publicJob = (job: StoredExportJob<RenderRequest>) => ({
   id: job.id,
   stage: job.stage,
   progress: job.progress,
   message: job.message,
   filename: job.filename,
+  createdAt: job.createdAt,
+  updatedAt: job.updatedAt,
+  attempts: job.attempts,
   sizeBytes: job.sizeBytes,
   error: job.error,
   downloadUrl: job.stage === "complete" ? `/api/render/${job.id}/download` : undefined,
 });
 
 export const directorsCutProRenderPlugin = (): Plugin => {
-  const jobs = new Map<string, RenderJob>();
   let bundlePromise: Promise<string> | null = null;
 
   const install = (middlewares: Connect.Server, root: string) => {
     const dataDir = path.join(root, ".infinity-cut");
     const mediaDir = path.join(dataDir, "media");
     const renderDir = path.join(dataDir, "renders");
-
-    const startRender = async (job: RenderJob, request: RenderRequest) => {
+    const mediaSourcePath = (src: string) => {
+      const local = src.match(/^\/api\/media\/([a-f0-9-]+)\/([^/?#]+)/i);
+      if (local) return path.join(mediaDir, `${local[1]}-${safeFilename(decodeURIComponent(local[2]))}`);
+      if (/^https?:\/\//i.test(src) || path.isAbsolute(src)) return src;
+      return path.join(root, "public", src.replace(/^\/+/, ""));
+    };
+    const runFfmpeg = (args: string[], signal: AbortSignal) => new Promise<void>((resolve, reject) => {
+      const child = spawn("ffmpeg", args, {stdio: ["ignore", "ignore", "pipe"]});
+      let stderr = "";
+      child.stderr.on("data", (chunk) => { stderr = `${stderr}${String(chunk)}`.slice(-8_000); });
+      const abort = () => child.kill("SIGTERM");
+      signal.addEventListener("abort", abort, {once: true});
+      child.once("error", reject);
+      child.once("exit", (code) => {
+        signal.removeEventListener("abort", abort);
+        if (signal.aborted) reject(new Error("Export cancelled"));
+        else if (code === 0) resolve();
+        else reject(new Error(stderr.trim() || `FFmpeg exited with code ${code}`));
+      });
+    });
+    const hasAudioStream = (source: string, signal: AbortSignal) => new Promise<boolean>((resolve) => {
+      const child = spawn("ffprobe", ["-v", "error", "-select_streams", "a:0", "-show_entries", "stream=index", "-of", "csv=p=0", source], {stdio: ["ignore", "pipe", "ignore"]});
+      let output = "";
+      child.stdout.on("data", (chunk) => { output += String(chunk); });
+      const abort = () => child.kill("SIGTERM");
+      signal.addEventListener("abort", abort, {once: true});
+      child.once("error", () => resolve(false));
+      child.once("exit", () => { signal.removeEventListener("abort", abort); resolve(Boolean(output.trim())); });
+    });
+    const renderProfessionalAudio = async (options: {project: EditorProject; output: string; frameRange: [number, number] | null; signal: AbortSignal; videoInput?: string; audioCodec: "aac" | "libopus" | "pcm_s16le" | "pcm_s24le"}) => {
+      const candidates = options.project.clips.filter((clip) => clip.src && (clip.kind === "audio" || clip.kind === "video"));
+      const checks = await Promise.all(candidates.map(async (clip) => ({clip, audible: await hasAudioStream(mediaSourcePath(clip.src!), options.signal)})));
+      const clips = checks.filter((item) => item.audible).map((item) => item.clip);
+      const firstAudioIndex = options.videoInput ? 1 : 0;
+      const inputIndex = new Map(clips.map((clip, index) => [clip.id, firstAudioIndex + index]));
+      const mix = buildProjectAudioMix(options.project, (clipId) => inputIndex.has(clipId) ? {inputIndex: inputIndex.get(clipId)!} : undefined);
+      const graph = buildFfmpegAudioGraph(mix);
+      const args = ["-hide_banner", "-loglevel", "error", "-y"];
+      if (options.videoInput) args.push("-i", options.videoInput);
+      for (const clip of clips) args.push("-i", mediaSourcePath(clip.src!));
+      args.push("-filter_complex", graph.filterComplex);
+      if (options.videoInput) args.push("-map", "0:v:0", "-c:v", "copy");
+      args.push("-map", `[${graph.outputLabel}]`, "-c:a", options.audioCodec);
+      if (options.audioCodec === "aac") args.push("-b:a", "320k");
+      if (options.audioCodec === "libopus") args.push("-b:a", "256k");
+      if (options.frameRange) {
+        args.push("-ss", String(options.frameRange[0] / options.project.fps));
+        args.push("-t", String((options.frameRange[1] - options.frameRange[0] + 1) / options.project.fps));
+      }
+      args.push(options.output);
+      await runFfmpeg(args, options.signal);
+    };
+    const queue = new PersistentExportQueue<RenderRequest>(path.join(dataDir, "render-queue.json"), async (job, controls) => {
+      const request = job.request;
       const {project} = request;
-      const format: RenderFormat = ["webm", "hevc", "prores"].includes(request.format ?? "") ? request.format! : "mp4";
+      const format: RenderFormat = ["webm", "hevc", "prores", "png-sequence", "jpeg-sequence", "wav", "audio-stems"].includes(request.format ?? "") ? request.format! : "mp4";
       const quality: RenderQuality = ["draft", "standard", "high"].includes(request.quality ?? "") ? request.quality! : "standard";
       const resolution: RenderResolution = request.resolution === "720p" ? "720p" : "source";
-      const encoding = resolveRenderEncoding(format, quality);
       const scale = resolution === "720p" ? Math.min(1, 720 / project.height) : 1;
       const {cancelSignal, cancel} = makeCancelSignal();
-      job.cancel = cancel;
+      controls.signal.addEventListener("abort", cancel, {once: true});
+      let frameDirectory: string | null = null;
+      let videoTemp: string | null = null;
 
       try {
         await mkdir(renderDir, {recursive: true});
-        job.stage = "bundling";
-        job.message = "Preparing the Remotion renderer";
-        job.progress = 2;
+        await controls.setState({stage: "bundling", message: "Preparing the Remotion renderer", progress: 2});
         if (!bundlePromise) {
           bundlePromise = bundle({
             entryPoint: path.join(root, "src/index.ts"),
             publicDir: path.join(root, "public"),
             onProgress: (value) => {
               const normalized = value > 1 ? value / 100 : value;
-              job.progress = Math.max(job.progress, Math.round(normalized * 8));
+              void controls.setState({progress: Math.max(job.progress, Math.round(normalized * 8))});
             },
           }).catch((error) => {
             bundlePromise = null;
@@ -141,7 +185,7 @@ export const directorsCutProRenderPlugin = (): Plugin => {
           });
         }
         const serveUrl = await bundlePromise;
-        if (jobs.get(job.id)?.stage === "cancelled") return;
+        if (controls.signal.aborted) throw new Error("Export cancelled");
 
         const inputProps = {project};
         const composition = await selectComposition({
@@ -151,59 +195,75 @@ export const directorsCutProRenderPlugin = (): Plugin => {
           logLevel: "warn",
         });
 
-        job.stage = "rendering";
-        job.message = "Rendering frames and mixing audio";
-        job.progress = 10;
+        await controls.setState({stage: "rendering", message: format.endsWith("sequence") ? "Rendering image sequence" : format === "audio-stems" ? "Rendering audio stems" : format === "wav" ? "Rendering lossless audio mix" : "Rendering frames and mixing audio", progress: 10});
         const frameRange = request.frameRange && request.frameRange.length === 2
           ? [Math.max(0, Math.round(request.frameRange[0])), Math.min(project.durationInFrames - 1, Math.round(request.frameRange[1]))] as [number, number]
           : null;
 
-        await renderMedia({
-          codec: encoding.codec,
-          composition,
-          serveUrl,
-          inputProps,
-          outputLocation: job.outputPath,
-          overwrite: true,
-          crf: encoding.crf,
-          scale,
-          frameRange,
-          imageFormat: "jpeg",
-          jpegQuality: quality === "draft" ? 72 : quality === "high" ? 95 : 86,
-          audioCodec: encoding.audioCodec,
-          audioBitrate: format === "prores" ? undefined : quality === "draft" ? "128k" : quality === "high" ? "320k" : "192k",
-          pixelFormat: encoding.pixelFormat,
-          proResProfile: encoding.proResProfile,
-          preferLossless: format === "prores",
-          x264Preset: encoding.codec === "h264" ? "veryfast" : undefined,
-          hardwareAcceleration: encoding.codec === "h264" || encoding.codec === "h265" ? "if-possible" : "disable",
-          cancelSignal,
-          logLevel: "warn",
-          onProgress: ({progress}) => {
-            job.progress = Math.max(10, Math.min(99, Math.round(10 + progress * 89)));
-          },
-        });
-
-        const output = await stat(job.outputPath);
-        job.stage = "complete";
-        job.progress = 100;
-        job.message = "Video ready to download";
-        job.sizeBytes = output.size;
-        job.cancel = undefined;
-      } catch (error) {
-        if (job.stage === "cancelled" || (error instanceof Error && error.message.toLowerCase().includes("cancel"))) {
-          job.stage = "cancelled";
-          job.message = "Export cancelled";
-          job.error = undefined;
+        if (format === "png-sequence" || format === "jpeg-sequence") {
+          frameDirectory = path.join(renderDir, `.frames-${job.id}`);
+          await mkdir(frameDirectory, {recursive: true});
+          const imageFormat = format === "png-sequence" ? "png" : "jpeg";
+          await renderFrames({
+            composition, serveUrl, inputProps, outputDir: frameDirectory, frameRange, scale, imageFormat,
+            imageSequencePattern: `frame-[frame].${imageFormat === "jpeg" ? "jpg" : "png"}`,
+            jpegQuality: quality === "draft" ? 72 : quality === "high" ? 95 : 86,
+            cancelSignal, logLevel: "warn", onStart: () => undefined,
+            onFrameUpdate: (framesRendered) => {
+              const total = frameRange ? frameRange[1] - frameRange[0] + 1 : project.durationInFrames;
+              void controls.setState({progress: Math.max(10, Math.min(90, Math.round(10 + (framesRendered / total) * 80)))});
+            },
+          });
+          await controls.setState({stage: "packaging", message: "Packaging image sequence", progress: 92});
+          const names = (await readdir(frameDirectory)).filter((name) => name.endsWith(imageFormat === "jpeg" ? ".jpg" : ".png")).sort();
+          if (!names.length) throw new Error("The renderer did not produce any image frames");
+          const sizeBytes = await writeStoredZip(job.outputPath, names.map((name) => ({path: path.join(frameDirectory!, name), name})));
+          return {sizeBytes};
+        } else if (format === "wav") {
+          await renderProfessionalAudio({project, output: job.outputPath, frameRange, signal: controls.signal, audioCodec: "pcm_s24le"});
+          return {sizeBytes: (await stat(job.outputPath)).size};
+        } else if (format === "audio-stems") {
+          frameDirectory = path.join(renderDir, `.stems-${job.id}`);
+          await mkdir(frameDirectory, {recursive: true});
+          const audioTracks = project.tracks.filter((track) => track.kind === "audio");
+          if (!audioTracks.length) throw new Error("This project has no audio tracks to export as stems");
+          const files: {path: string; name: string}[] = [];
+          for (let index = 0; index < audioTracks.length; index++) {
+            if (controls.signal.aborted) throw new Error("Export cancelled");
+            const selected = audioTracks[index];
+            const stemProject = {...project, tracks: project.tracks.map((track) => ({...track, muted: track.id !== selected.id, solo: false}))};
+            const stemName = `${String(index + 1).padStart(2, "0")}-${safeFilename(selected.name)}.wav`;
+            const stemPath = path.join(frameDirectory, stemName);
+            await renderProfessionalAudio({project: stemProject, output: stemPath, frameRange, signal: controls.signal, audioCodec: "pcm_s24le"});
+            await controls.setState({progress: Math.round(10 + ((index + 1) / audioTracks.length) * 80)});
+            files.push({path: stemPath, name: stemName});
+          }
+          await controls.setState({stage: "packaging", message: "Packaging audio stems", progress: 92});
+          return {sizeBytes: await writeStoredZip(job.outputPath, files)};
         } else {
-          job.stage = "error";
-          job.message = "Export failed";
-          job.error = error instanceof Error ? error.message : String(error);
+          const encoding = resolveRenderEncoding(format, quality);
+          videoTemp = path.join(renderDir, `.silent-${job.id}.${encoding.extension}`);
+          const silentProject = {...project, tracks: project.tracks.map((track) => ({...track, muted: true, solo: false})), clips: project.clips.map((clip) => ({...clip, audioMuted: true}))};
+          await renderMedia({
+            codec: encoding.codec, composition, serveUrl, inputProps: {project: silentProject}, outputLocation: videoTemp, overwrite: true,
+            crf: encoding.crf, scale, frameRange: null, imageFormat: "jpeg", jpegQuality: quality === "draft" ? 72 : quality === "high" ? 95 : 86,
+            audioCodec: encoding.audioCodec, audioBitrate: format === "prores" ? undefined : quality === "draft" ? "128k" : quality === "high" ? "320k" : "192k",
+            pixelFormat: encoding.pixelFormat, proResProfile: encoding.proResProfile, preferLossless: format === "prores",
+            x264Preset: encoding.codec === "h264" ? "veryfast" : undefined,
+            hardwareAcceleration: encoding.codec === "h264" || encoding.codec === "h265" ? "if-possible" : "disable",
+            cancelSignal, logLevel: "warn",
+            onProgress: ({progress}) => void controls.setState({progress: Math.max(10, Math.min(78, Math.round(10 + progress * 68)))}),
+          });
+          await controls.setState({stage: "packaging", message: "Applying mixer, buses, and processor rack", progress: 80});
+          await renderProfessionalAudio({project, output: job.outputPath, frameRange, signal: controls.signal, videoInput: videoTemp, audioCodec: format === "webm" ? "libopus" : format === "prores" ? "pcm_s16le" : "aac"});
+          return {sizeBytes: (await stat(job.outputPath)).size};
         }
-        job.cancel = undefined;
-        await unlink(job.outputPath).catch(() => undefined);
+      } finally {
+        if (frameDirectory) await rm(frameDirectory, {recursive: true, force: true});
+        if (videoTemp) await rm(videoTemp, {force: true});
       }
-    };
+    }, renderDir);
+    const queueReady = queue.initialize();
 
     middlewares.use(async (request, response, next) => {
       if (!request.url) return next();
@@ -258,6 +318,35 @@ export const directorsCutProRenderPlugin = (): Plugin => {
         }
       }
 
+      await queueReady;
+
+      if (request.method === "GET" && url.pathname === "/api/export/capabilities") {
+        return sendJson(response, 200, {
+          queue: {persistent: true, concurrency: 1},
+          formats: [
+            {id: "mp4", available: true, label: "H.264 MP4"},
+            {id: "webm", available: true, label: "VP9 WebM"},
+            {id: "hevc", available: true, label: "HEVC H.265"},
+            {id: "prores", available: true, label: "Apple ProRes"},
+            {id: "png-sequence", available: true, label: "PNG image sequence ZIP"},
+            {id: "jpeg-sequence", available: true, label: "JPEG image sequence ZIP"},
+          ],
+          interchange: [
+            {id: "cmx3600", available: true, label: "CMX 3600 EDL"},
+            {id: "fcp7-xml", available: true, label: "Final Cut Pro 7 XML"},
+            {id: "aaf", available: false, label: "AAF", reason: "No proven AAF authoring library is installed. AAF is disabled to avoid generating invalid interchange files."},
+          ],
+          audio: [
+            {id: "wav", available: true, label: "Lossless WAV mix"},
+            {id: "audio-stems", available: true, label: "Per-track WAV stems ZIP"},
+          ],
+        });
+      }
+
+      if (request.method === "GET" && url.pathname === "/api/render") {
+        return sendJson(response, 200, queue.list().map(publicJob));
+      }
+
       if (request.method === "POST" && url.pathname === "/api/render") {
         try {
           const body = await readJson(request);
@@ -265,42 +354,55 @@ export const directorsCutProRenderPlugin = (): Plugin => {
             return sendJson(response, 400, {error: "Invalid Directors Cut Pro project"});
           }
           const id = randomUUID();
-          const format: RenderFormat = ["webm", "hevc", "prores"].includes(body.format ?? "") ? body.format! : "mp4";
+          const format: RenderFormat = ["webm", "hevc", "prores", "png-sequence", "jpeg-sequence", "wav", "audio-stems"].includes(body.format ?? "") ? body.format! : "mp4";
           const quality: RenderQuality = ["draft", "standard", "high"].includes(body.quality ?? "") ? body.quality! : "standard";
-          const encoding = resolveRenderEncoding(format, quality);
+          const extension = format === "png-sequence" || format === "jpeg-sequence" || format === "audio-stems" ? "zip" : format === "wav" ? "wav" : resolveRenderEncoding(format, quality).extension;
           const baseName = safeFilename(body.project.name.toLowerCase()) || "directors-cut-pro-export";
-          const filename = `${baseName}-${id.slice(0, 8)}.${encoding.extension}`;
-          const job: RenderJob = {
+          const filename = `${baseName}-${id.slice(0, 8)}.${extension}`;
+          const now = Date.now();
+          const job: StoredExportJob<RenderRequest> = {
             id,
             stage: "queued",
             progress: 0,
             message: "Export queued",
             filename,
             outputPath: path.join(renderDir, filename),
-            createdAt: Date.now(),
+            createdAt: now,
+            updatedAt: now,
+            attempts: 0,
+            request: {...body, format, quality},
           };
-          jobs.set(id, job);
-          void startRender(job, body);
+          await queue.add(job);
           return sendJson(response, 202, publicJob(job));
         } catch (error) {
           return sendJson(response, 400, {error: error instanceof Error ? error.message : "Invalid render request"});
         }
       }
 
-      const renderMatch = url.pathname.match(/^\/api\/render\/([a-f0-9-]+)(?:\/(download))?$/i);
+      const renderMatch = url.pathname.match(/^\/api\/render\/([a-f0-9-]+)(?:\/(download|cancel|retry))?$/i);
       if (renderMatch) {
-        const job = jobs.get(renderMatch[1]);
+        const job = queue.get(renderMatch[1]);
         if (!job) return sendJson(response, 404, {error: "Render job not found"});
+        if (request.method === "POST" && renderMatch[2] === "cancel") {
+          const cancelled = await queue.cancel(job.id);
+          return sendJson(response, 200, publicJob(cancelled!));
+        }
+        if (request.method === "POST" && renderMatch[2] === "retry") {
+          const retried = await queue.retry(job.id);
+          if (!retried) return sendJson(response, 409, {error: "Only cancelled or failed exports can be retried"});
+          return sendJson(response, 202, publicJob(retried));
+        }
         if (request.method === "DELETE" && !renderMatch[2]) {
-          if (["queued", "bundling", "rendering"].includes(job.stage)) {
-            job.stage = "cancelled";
-            job.message = "Cancelling export";
-            job.cancel?.();
+          if (["queued", "bundling", "rendering", "packaging"].includes(job.stage)) {
+            const cancelled = await queue.cancel(job.id);
+            return sendJson(response, 200, publicJob(cancelled!));
           }
-          return sendJson(response, 200, publicJob(job));
+          if (!(await queue.remove(job.id))) return sendJson(response, 409, {error: "Active exports must be cancelled before removal"});
+          response.statusCode = 204;
+          return response.end();
         }
         if (request.method === "GET" && renderMatch[2] === "download") {
-          if (job.stage !== "complete") return sendJson(response, 409, {error: "Video is not ready"});
+          if (job.stage !== "complete") return sendJson(response, 409, {error: "Export is not ready"});
           const file = await stat(job.outputPath).catch(() => null);
           if (!file) return sendJson(response, 404, {error: "Rendered video not found"});
           response.statusCode = 200;

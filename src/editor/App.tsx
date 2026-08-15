@@ -74,10 +74,13 @@ import {cloneClips, moveClips, placeMedia, retimeClip, rippleDelete, splitClip, 
 import {conformMediaToFrameRate, formatFrameRate, frameRatesMatch, normalizeFrameRate, retimeProjectForFrameRate} from "./frame-rate";
 import {createProjectFile, normalizeProject, saveStoredProject} from "./project-storage";
 import {canNestSequence, createSequence, switchActiveSequence, syncActiveSequence} from "./sequences";
-import {createReviewComment, createVersionSnapshot, diffProjects, setReviewCommentResolved, type ProjectVersionSnapshot, type ReviewComment} from "./collaboration";
+import {appendSharedComment, createReviewComment, createVersionSnapshot, diffProjects, fetchSharedProject, publishSharedProject, setReviewCommentResolved, updateSharedComments, updateSharedProject, type ProjectVersionSnapshot, type ReviewComment, type SharedProjectPayload, type SharedProjectSession} from "./collaboration";
 import {exportCmx3600Edl, exportFcp7Xml} from "./interchange";
 import type {EditorClip, EditorProject, EditorTrack, EditorTransition, KeyframeProperty, MediaKind, ProjectMedia, TextStyle, TransitionType} from "./types";
 import {DEFAULT_CAPTION_STYLE, DEFAULT_COLOR_GRADE, DEFAULT_EFFECTS, DEFAULT_TITLE_STYLE, DEFAULT_TRANSFORM} from "./types";
+import {AudioMixerPanel, observeLiveAudioPreview, VoiceoverRecorder, type VoiceoverRecording, type VoiceoverUpload} from "./audio";
+import {createVisualEffectInstance, getVisualEffectDescriptor, listVisualEffects, type VisualEffectInstance} from "./effects/registry";
+import {importObjectMatteSequence} from "./mattes/object-matte";
 
 type MediaItem = ProjectMedia;
 type MediaView = "grid" | "list";
@@ -85,7 +88,7 @@ type MediaSort = "name" | "duration" | "type" | "date";
 type MediaFileAction = "relink" | "replace";
 type ScopeMode = "waveform" | "rgb";
 type ScopeData = {waveform: number[]; red: number[]; green: number[]; blue: number[]};
-type ExportFormat = "mp4" | "webm" | "hevc" | "prores";
+type ExportFormat = "mp4" | "webm" | "hevc" | "prores" | "png-sequence" | "jpeg-sequence" | "wav" | "audio-stems";
 type ExportQuality = "draft" | "standard" | "high";
 type ExportResolution = "source" | "720p";
 type ExportRange = "sequence" | "selected";
@@ -107,13 +110,15 @@ type SpeedDialogState = {
 };
 type RenderJobStatus = {
   id: string;
-  stage: "queued" | "bundling" | "rendering" | "complete" | "cancelled" | "error";
+  stage: "queued" | "bundling" | "rendering" | "packaging" | "complete" | "cancelled" | "error";
   progress: number;
   message: string;
   filename: string;
   sizeBytes?: number;
   error?: string;
   downloadUrl?: string;
+  createdAt?: number;
+  attempts?: number;
 };
 type PropertyGroup = "transform" | "effects" | "audio";
 type TimelineTool = "select" | "razor" | "ripple" | "roll" | "slip" | "slide";
@@ -208,6 +213,10 @@ const EXPORT_FORMAT_LABELS: Record<ExportFormat, {name: string; summary: string;
   hevc: {name: "MP4 (HEVC / H.265)", summary: "HEVC + AAC", download: "HEVC"},
   prores: {name: "QuickTime (Apple ProRes 422)", summary: "ProRes 422 + PCM", download: "MOV"},
   webm: {name: "WebM (VP9)", summary: "VP9 + Opus", download: "WEBM"},
+  "png-sequence": {name: "PNG image sequence", summary: "Lossless PNG frames · ZIP", download: "ZIP"},
+  "jpeg-sequence": {name: "JPEG image sequence", summary: "JPEG frames · ZIP", download: "ZIP"},
+  wav: {name: "WAV master mix", summary: "Lossless PCM audio", download: "WAV"},
+  "audio-stems": {name: "WAV track stems", summary: "One WAV per audio track · ZIP", download: "ZIP"},
 };
 
 const formatTimecode = (frame: number, fps: number) => {
@@ -335,11 +344,18 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
   const [projectVersions, setProjectVersions] = useState<ProjectVersionSnapshot[]>(() => {
     try { return JSON.parse(window.localStorage.getItem(`directors-project-versions:${projectId}`) ?? "[]") as ProjectVersionSnapshot[]; } catch { return []; }
   });
+  const [sharedSession, setSharedSession] = useState<SharedProjectSession | null>(() => {
+    try { return JSON.parse(window.localStorage.getItem(`directors-shared-session:${projectId}`) ?? "null") as SharedProjectSession | null; } catch { return null; }
+  });
+  const [sharedStatus, setSharedStatus] = useState<"local" | "syncing" | "synced" | "conflict" | "error">("local");
+  const [remoteConflict, setRemoteConflict] = useState<SharedProjectPayload | null>(null);
+  const [effectsSearch, setEffectsSearch] = useState("");
   const [exportFormat, setExportFormat] = useState<ExportFormat>("mp4");
   const [exportQuality, setExportQuality] = useState<ExportQuality>("standard");
   const [exportResolution, setExportResolution] = useState<ExportResolution>("source");
   const [exportRange, setExportRange] = useState<ExportRange>("sequence");
   const [renderJob, setRenderJob] = useState<RenderJobStatus | null>(null);
+  const [exportJobs, setExportJobs] = useState<RenderJobStatus[]>([]);
   const [renderStarting, setRenderStarting] = useState(false);
   const [frameRateMismatch, setFrameRateMismatch] = useState<FrameRateMismatch | null>(null);
   const [speedDialog, setSpeedDialog] = useState<SpeedDialogState | null>(null);
@@ -395,6 +411,11 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
   useEffect(() => {
     window.localStorage.setItem(`directors-project-versions:${projectId}`, JSON.stringify(projectVersions.slice(-20)));
   }, [projectId, projectVersions]);
+
+  useEffect(() => {
+    if (sharedSession) window.localStorage.setItem(`directors-shared-session:${projectId}`, JSON.stringify(sharedSession));
+    else window.localStorage.removeItem(`directors-shared-session:${projectId}`);
+  }, [projectId, sharedSession]);
 
   useEffect(() => {
     setDestinationRoutes((current) => {
@@ -910,6 +931,13 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
       player.removeEventListener("pause", onPause);
     };
   }, []);
+
+  useEffect(() => {
+    if (!isPlaying) return;
+    const root = document.querySelector<HTMLElement>(".program-panel");
+    if (!root) return;
+    return observeLiveAudioPreview(root, project, () => setToast("Some live audio processors could not connect; final export settings are preserved"));
+  }, [isPlaying, project]);
 
   useEffect(() => {
     for (const clip of project.clips.filter((item) => item.kind === "audio" && item.src)) {
@@ -1604,19 +1632,62 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
     updateSelectedEffects({...colorClipboardRef.current}, "Pasted color settings");
   }, [updateSelectedEffects]);
 
-  const applyVideoEffect = useCallback((name: string) => {
+  const applyVideoEffect = useCallback((descriptorId: string) => {
     if (!selectedClip || selectedClip.kind === "audio" || selectedClip.kind === "caption") {
       setToast("Select a visual clip before adding an effect");
       return;
     }
-    if (name === "Lumetri Color") {
-      updateSelectedEffects({enabled: true, colorEnabled: true}, "Lumetri Color ready");
-      setActiveLeftTab("color");
-    } else if (name === "Gaussian Blur") updateSelectedEffects({blurEnabled: true, blur: Math.max(8, selectedClip.effects.blur)}, "Added Gaussian Blur");
-    else if (name === "Film Grain") updateSelectedEffects({grainEnabled: true, grain: Math.max(24, selectedClip.effects.grain)}, "Added Film Grain");
-    else if (name === "Glow") updateSelectedEffects({glowEnabled: true, glow: Math.max(24, selectedClip.effects.glow)}, "Added Glow");
-    else if (name === "Transform") setToast("Transform controls are in the Inspector");
-  }, [selectedClip, updateSelectedEffects]);
+    const descriptor = getVisualEffectDescriptor(descriptorId);
+    if (!descriptor || !descriptor.supportedKinds.includes(selectedClip.kind as never)) {
+      setToast("That effect is not compatible with the selected clip");
+      return;
+    }
+    const instance = createVisualEffectInstance(descriptorId, `effect-${Date.now()}-${clipIdCounterRef.current++}`);
+    commit((draft) => {
+      const clip = draft.clips.find((item) => item.id === selectedClip.id);
+      if (clip) clip.visualEffects = [...(clip.visualEffects ?? []), instance];
+    }, `Added ${descriptor.name}`);
+  }, [commit, selectedClip]);
+
+  const updateVisualEffect = (effectId: string, updater: (effect: VisualEffectInstance) => VisualEffectInstance | null) => {
+    if (!selectedClip) return;
+    commit((draft) => {
+      const clip = draft.clips.find((item) => item.id === selectedClip.id);
+      if (!clip) return;
+      clip.visualEffects = (clip.visualEffects ?? []).flatMap((effect) => {
+        if (effect.id !== effectId) return [effect];
+        const next = updater(effect);
+        return next ? [next] : [];
+      });
+    }, "Updated effect stack");
+  };
+
+  const importObjectMatte = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const files = [...(event.target.files ?? [])];
+    event.target.value = "";
+    if (!selectedClip || !files.length) return;
+    if (selectedClip.kind === "audio" || selectedClip.kind === "caption") {
+      setToast("Select a visual clip before importing an object matte");
+      return;
+    }
+    setToast(`Uploading ${files.length} matte ${files.length === 1 ? "frame" : "frames"}…`);
+    try {
+      const uploaded = await Promise.all(files.map(async (file) => {
+        const response = await fetch(`/api/media?name=${encodeURIComponent(file.name)}`, {method: "POST", headers: {"Content-Type": file.type || "image/png"}, body: file});
+        const body = await response.json() as {url?: string; error?: string};
+        if (!response.ok || !body.url) throw new Error(body.error ?? `Could not upload ${file.name}`);
+        return {name: file.name, src: body.url};
+      }));
+      const matte = importObjectMatteSequence({id: `matte-${Date.now()}`, name: files.length > 1 ? "Object Matte Sequence" : files[0].name, files: uploaded});
+      commit((draft) => {
+        const clip = draft.clips.find((item) => item.id === selectedClip.id);
+        if (clip) clip.objectMattes = [...(clip.objectMattes ?? []), matte];
+      }, "Imported object matte");
+      setToast(`Object matte added with ${matte.frames.length} frames`);
+    } catch (error) {
+      setToast(error instanceof Error ? error.message : "Object matte import failed");
+    }
+  };
 
   useEffect(() => {
     if (activeLeftTab !== "color" || !selectedClip || selectedClip.kind === "audio" || selectedClip.kind === "caption") return;
@@ -1765,13 +1836,6 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
     });
   };
 
-  const updateTrackVolume = (trackId: string, db: number) => {
-    commit((draft) => {
-      const track = draft.tracks.find((candidate) => candidate.id === trackId);
-      if (track) track.volume = dbToLinear(db);
-    }, `Updated ${project.tracks.find((track) => track.id === trackId)?.name ?? "track"} volume`);
-  };
-
   const beginDrag = (event: React.PointerEvent, clip: EditorClip, mode: DragMode) => {
     event.stopPropagation();
     setContextMenu(null);
@@ -1873,7 +1937,8 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
       const result = await response.json() as RenderJobStatus & {error?: string};
       if (!response.ok) throw new Error(result.error ?? "The render service rejected the export");
       setRenderJob(result);
-      setToast("Video export started");
+      setExportJobs((current) => [result, ...current.filter((job) => job.id !== result.id)]);
+      setToast("Export queued");
     } catch (error) {
       setRenderJob({id: "start-error", stage: "error", progress: 0, message: "Export could not start", filename: "", error: error instanceof Error ? error.message : String(error)});
     } finally {
@@ -1893,6 +1958,7 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
     try {
       const comment = createReviewComment({sequenceId: project.activeSequenceId, frame, author: "You", body: reviewCommentText});
       setReviewComments((current) => [comment, ...current]);
+      if (sharedSession?.role === "reviewer") void appendSharedComment(sharedSession, comment).then((remote) => setReviewComments(remote.comments)).catch((error) => setToast(error instanceof Error ? error.message : "Could not share review note"));
       setReviewCommentText("");
       setToast(`Review note added at ${formatTimecode(frame, project.fps)}`);
     } catch (error) {
@@ -1914,11 +1980,108 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
     setToast(`Restored ${version.label ?? `revision ${version.revision}`}`);
   };
 
+  const addVoiceoverToTimeline = (upload: VoiceoverUpload, recording: VoiceoverRecording) => {
+    const audioTrack = project.tracks.find((track) => track.id === destinationRoutes.audio && track.kind === "audio" && !track.locked)
+      ?? project.tracks.find((track) => track.kind === "audio" && !track.locked);
+    if (!audioTrack) {
+      setToast("Unlock or create an audio track before recording voiceover");
+      return;
+    }
+    const stamp = Date.now();
+    const mediaId = `voiceover-media-${stamp}`;
+    const clipId = `voiceover-clip-${stamp}`;
+    const duration = Math.max(1, Math.round(recording.durationMs / 1000 * project.fps));
+    commit((draft) => {
+      draft.media.push({id: mediaId, name: upload.fileName.replace(/\.[^.]+$/, ""), kind: "audio", src: upload.src, duration, durationInSeconds: recording.durationMs / 1000, color: "#43b984", binId: "bin-audio", fileName: upload.fileName, fileSize: upload.size, mimeType: upload.mimeType, importedAt: stamp, renderReady: true});
+      draft.clips.push({id: clipId, name: "Voiceover", kind: "audio", trackId: audioTrack.id, start: frame, duration, sourceStart: 0, src: upload.src, color: "#43b984", volume: 1, fadeIn: 0, fadeOut: 0, audioMuted: false, audioPan: 0, audioProcessors: [], playbackRate: 1, preservePitch: true, transform: {...DEFAULT_TRANSFORM}, effects: {...DEFAULT_EFFECTS}, keyframes: [], sourceMediaId: mediaId});
+      draft.durationInFrames = Math.max(draft.durationInFrames, frame + duration);
+    }, "Recorded voiceover");
+    setSelectedClipIds([clipId]);
+    setToast(`Voiceover added to ${audioTrack.name} at ${formatTimecode(frame, project.fps)}`);
+  };
+
+  const publishForReview = async () => {
+    setSharedStatus("syncing");
+    try {
+      const {session} = await publishSharedProject(syncActiveSequence(project));
+      await updateSharedComments(session, reviewComments);
+      setSharedSession(session);
+      setSharedStatus("synced");
+      setToast("Private shared project created");
+    } catch (error) {
+      setSharedStatus("error");
+      setToast(error instanceof Error ? error.message : "Could not publish shared project");
+    }
+  };
+
+  const syncSharedProject = async () => {
+    if (!sharedSession) return publishForReview();
+    if (sharedSession.role === "reviewer") return reloadSharedProject();
+    setSharedStatus("syncing");
+    try {
+      const remote = await updateSharedProject(sharedSession, syncActiveSequence(project));
+      await updateSharedComments({...sharedSession, revision: remote.revision}, reviewComments);
+      setSharedSession({...sharedSession, revision: remote.revision});
+      setRemoteConflict(null);
+      setSharedStatus("synced");
+      setToast(`Shared revision ${remote.revision} is current`);
+    } catch (error) {
+      const detail = error as Error & {status?: number; payload?: {current?: SharedProjectPayload}};
+      if (detail.status === 409 && detail.payload?.current) {
+        setRemoteConflict(detail.payload.current);
+        setSharedStatus("conflict");
+        setToast("Shared project has a newer revision — your edit was not overwritten");
+      } else {
+        setSharedStatus("error");
+        setToast(detail.message || "Shared project sync failed");
+      }
+    }
+  };
+
+  const copyReviewerLink = async () => {
+    if (!sharedSession?.reviewerToken) return;
+    const link = `${window.location.origin}${window.location.pathname}#review=${sharedSession.id}.${sharedSession.reviewerToken}`;
+    await navigator.clipboard.writeText(link);
+    setToast("Reviewer link copied · comment-only access");
+  };
+
+  const reloadSharedProject = async () => {
+    if (!sharedSession) return;
+    setSharedStatus("syncing");
+    try {
+      const remote = remoteConflict ?? await fetchSharedProject(sharedSession);
+      setPast((current) => [...current.slice(-49), cloneProject(project)]);
+      setFuture([]);
+      setProject(normalizeProject(remote.project));
+      setReviewComments(remote.comments);
+      setSharedSession({...sharedSession, revision: remote.revision});
+      setRemoteConflict(null);
+      setSharedStatus("synced");
+      setToast(`Loaded shared revision ${remote.revision}`);
+    } catch (error) {
+      setSharedStatus("error");
+      setToast(error instanceof Error ? error.message : "Could not load shared project");
+    }
+  };
+
   const renderJobId = renderJob?.id;
   const renderJobStage = renderJob?.stage;
 
   useEffect(() => {
-    if (!renderJobId || !renderJobStage || !["queued", "bundling", "rendering"].includes(renderJobStage)) return;
+    if (!exportOpen) return;
+    let disposed = false;
+    const refresh = () => void fetch("/api/render").then(async (response) => {
+      if (!response.ok || disposed) return;
+      const jobs = await response.json() as RenderJobStatus[];
+      if (!disposed) setExportJobs(Array.isArray(jobs) ? jobs : []);
+    }).catch(() => undefined);
+    refresh();
+    const interval = window.setInterval(refresh, 750);
+    return () => { disposed = true; window.clearInterval(interval); };
+  }, [exportOpen]);
+
+  useEffect(() => {
+    if (!renderJobId || !renderJobStage || !["queued", "bundling", "rendering", "packaging"].includes(renderJobStage)) return;
     let disposed = false;
     let timeout: number | undefined;
     const poll = async () => {
@@ -1929,7 +2092,7 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
         if (disposed) return;
         setRenderJob(result);
         if (result.stage === "complete") setToast(`Video export ready · ${result.sizeBytes ? formatBytes(result.sizeBytes) : result.filename}`);
-        else if (["queued", "bundling", "rendering"].includes(result.stage)) timeout = window.setTimeout(poll, 500);
+        else if (["queued", "bundling", "rendering", "packaging"].includes(result.stage)) timeout = window.setTimeout(poll, 500);
       } catch (error) {
         if (!disposed) setRenderJob((current) => current ? {...current, stage: "error", message: "Lost connection to renderer", error: error instanceof Error ? error.message : String(error)} : current);
       }
@@ -2249,7 +2412,7 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
     if (result.ok) setToast(`Dropped ${added} ${added === 1 ? "clip" : "clips"} onto ${track.name}${duplicates ? ` · skipped ${duplicates} duplicate${duplicates === 1 ? "" : "s"}` : ""}${unavailable ? " · preview only until relinked" : " · ready to export"}`);
   };
 
-  const exportIsActive = Boolean(renderJob && ["queued", "bundling", "rendering"].includes(renderJob.stage));
+  const exportIsActive = Boolean(renderJob && ["queued", "bundling", "rendering", "packaging"].includes(renderJob.stage));
   const currentVersionChanges = projectVersions.length ? diffProjects(projectVersions[projectVersions.length - 1].project, project) : [];
   const speedDialogClip = speedDialog ? project.clips.find((clip) => clip.id === speedDialog.clipId) : null;
   const exportScale = exportResolution === "720p" ? Math.min(1, 720 / project.height) : 1;
@@ -2258,7 +2421,7 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
   const exportFrames = exportRange === "selected" && selectedClip ? selectedClip.duration : project.durationInFrames;
 
   return (
-    <div className={`editor-shell ${activeLeftTab === "color" ? "color-active" : ""}`}>
+    <div className={`editor-shell ${activeLeftTab === "color" ? "color-active" : ""} ${activeLeftTab === "audio" ? "audio-active" : ""}`}>
       {frameRateMismatch && (
         <div className="frame-rate-overlay">
           <section className="frame-rate-dialog" role="dialog" aria-modal="true" aria-labelledby="frame-rate-dialog-title">
@@ -2316,7 +2479,7 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
           <section className="review-dialog" role="dialog" aria-modal="true" aria-labelledby="review-dialog-title">
             <header>
               <div className="review-dialog-icon"><MessageSquare size={18} /></div>
-              <div><strong id="review-dialog-title">Review & versions</strong><small>Frame-accurate notes and local version comparison</small></div>
+              <div><strong id="review-dialog-title">Review & versions</strong><small>Frame-accurate notes, semantic versions, and protected sharing</small></div>
               <button onClick={() => setReviewOpen(false)} title="Close review"><X size={16} /></button>
             </header>
             <div className="review-columns">
@@ -2331,11 +2494,17 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
                   {reviewComments.length ? reviewComments.map((comment) => <article className={comment.status === "resolved" ? "resolved" : ""} key={comment.id}>
                     <button className="review-timecode" onClick={() => {if (comment.sequenceId === project.activeSequenceId) seek(comment.frame); setReviewOpen(false);}}>{formatTimecode(comment.frame, project.fps)}</button>
                     <div><strong>{comment.author}</strong><p>{comment.body}</p><small>{comment.status === "resolved" ? "Resolved" : "Needs review"}</small></div>
-                    <button onClick={() => setReviewComments((current) => current.map((item) => item.id === comment.id ? setReviewCommentResolved(item, item.status !== "resolved") : item))}>{comment.status === "resolved" ? "Reopen" : "Resolve"}</button>
+                    <button disabled={sharedSession?.role === "reviewer"} title={sharedSession?.role === "reviewer" ? "Only editors can change comment status" : undefined} onClick={() => setReviewComments((current) => current.map((item) => item.id === comment.id ? setReviewCommentResolved(item, item.status !== "resolved") : item))}>{comment.status === "resolved" ? "Reopen" : "Resolve"}</button>
                   </article>) : <div className="review-empty"><MessageSquare size={22} /><strong>No review notes yet</strong><span>Add a note tied to the current playhead.</span></div>}
                 </div>
               </section>
               <section className="review-versions-column">
+                <div className={`shared-project-bar ${sharedStatus}`}>
+                  <div><span>{sharedSession?.role === "reviewer" ? `Reviewer access · r${sharedSession.revision}` : sharedSession ? `Private share · r${sharedSession.revision}` : "Local project"}</span><small>{sharedStatus === "conflict" ? "A newer remote revision needs your decision" : sharedStatus === "syncing" ? "Synchronizing…" : sharedSession?.role === "reviewer" ? "Comment-only session; project edits cannot overwrite the shared cut" : sharedSession ? "Revision-safe workspace; stale edits are never overwritten" : "Publish to the private local collaboration service"}</small></div>
+                  {sharedSession?.reviewerToken && sharedSession.role !== "reviewer" ? <button onClick={() => void copyReviewerLink()}>Copy reviewer link</button> : null}
+                  <button disabled={sharedStatus === "syncing"} onClick={() => void syncSharedProject()}>{sharedSession?.role === "reviewer" ? "Refresh" : sharedSession ? "Sync" : "Publish"}</button>
+                </div>
+                {remoteConflict && <div className="shared-conflict"><Info size={14} /><div><strong>Revision conflict</strong><span>Remote revision {remoteConflict.revision} changed since this editor opened. Reloading preserves your current edit in undo history.</span></div><button onClick={() => void reloadSharedProject()}>Load remote</button><button onClick={() => {setSharedSession(null); setRemoteConflict(null); setSharedStatus("local"); setToast("Local edit detached from the shared project");}}>Keep as local copy</button></div>}
                 <div className="review-section-heading"><span>Version history</span><b>{projectVersions.length} saved</b></div>
                 <button className="save-review-version" onClick={saveReviewVersion}><Save size={14} /><span><strong>Save review version</strong><small>{currentVersionChanges.length ? `${currentVersionChanges.length} changes since last version` : projectVersions.length ? "No changes since last version" : "Create a comparison baseline"}</small></span></button>
                 {projectVersions.length ? <div className="review-diff-list"><header><span>Changes since {projectVersions[projectVersions.length - 1].label ?? `revision ${projectVersions[projectVersions.length - 1].revision}`}</span><b>{currentVersionChanges.length}</b></header>{currentVersionChanges.length ? currentVersionChanges.slice(0, 8).map((change, index) => <div key={`${change.entityType}-${change.entityId}-${change.category}-${index}`}><i className={change.category}>{change.category}</i><span><strong>{change.label}</strong><small>{change.entityType} · {change.category}</small></span></div>) : <p>Current edit matches the saved baseline.</p>}{currentVersionChanges.length > 8 ? <footer>+ {currentVersionChanges.length - 8} more changes</footer> : null}</div> : null}
@@ -2347,7 +2516,7 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
                   })}
                   {!projectVersions.length && <div className="review-empty"><Save size={22} /><strong>No review versions</strong><span>Save a named baseline before major edits.</span></div>}
                 </div>
-                <div className="review-boundary"><Info size={13} /><span>These review records are stored with this browser project. Secure shared projects, permissions, cloud media, and external approvals require a connected collaboration service.</span></div>
+                <div className="review-boundary"><Info size={13} /><span>Private sharing uses an unguessable editor token and revision conflicts on this Directors Cut Pro host. Internet-facing teams still require deployed identity, permissions, encrypted object storage, and audit controls.</span></div>
               </section>
             </div>
           </section>
@@ -2366,10 +2535,10 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
               <div><strong>{project.name}</strong><span>{exportWidth} × {exportHeight}</span><span>{formatFrameRate(project.fps)} fps · {formatTimecode(exportFrames, project.fps)}</span><span>{EXPORT_FORMAT_LABELS[exportFormat].summary}</span></div>
             </div>
             <div className="export-settings">
-              <label><span>Format</span><select aria-label="Export format" disabled={exportIsActive || renderStarting} value={exportFormat} onChange={(event) => setExportFormat(event.target.value as ExportFormat)}>{(Object.entries(EXPORT_FORMAT_LABELS) as Array<[ExportFormat, {name: string; summary: string; download: string}]>).map(([format, details]) => <option key={format} value={format}>{details.name}</option>)}</select></label>
-              <label><span>Resolution</span><select aria-label="Export resolution" disabled={exportIsActive || renderStarting} value={exportResolution} onChange={(event) => setExportResolution(event.target.value as ExportResolution)}><option value="source">Source ({project.width} × {project.height})</option><option value="720p">720p preview</option></select></label>
-              <label><span>Quality</span><select aria-label="Export quality" disabled={exportIsActive || renderStarting} value={exportQuality} onChange={(event) => setExportQuality(event.target.value as ExportQuality)}><option value="draft">Draft · faster</option><option value="standard">Standard</option><option value="high">High quality</option></select></label>
-              <label><span>Range</span><select aria-label="Export range" disabled={exportIsActive || renderStarting} value={exportRange} onChange={(event) => setExportRange(event.target.value as ExportRange)}><option value="sequence">Entire sequence</option><option value="selected" disabled={!selectedClip}>Selected clip{selectedClip ? ` · ${selectedClip.name}` : ""}</option></select></label>
+              <label><span>Format</span><select aria-label="Export format" disabled={renderStarting} value={exportFormat} onChange={(event) => setExportFormat(event.target.value as ExportFormat)}>{(Object.entries(EXPORT_FORMAT_LABELS) as Array<[ExportFormat, {name: string; summary: string; download: string}]>).map(([format, details]) => <option key={format} value={format}>{details.name}</option>)}</select></label>
+              <label><span>Resolution</span><select aria-label="Export resolution" disabled={renderStarting} value={exportResolution} onChange={(event) => setExportResolution(event.target.value as ExportResolution)}><option value="source">Source ({project.width} × {project.height})</option><option value="720p">720p preview</option></select></label>
+              <label><span>Quality</span><select aria-label="Export quality" disabled={renderStarting} value={exportQuality} onChange={(event) => setExportQuality(event.target.value as ExportQuality)}><option value="draft">Draft · faster</option><option value="standard">Standard</option><option value="high">High quality</option></select></label>
+              <label><span>Range</span><select aria-label="Export range" disabled={renderStarting} value={exportRange} onChange={(event) => setExportRange(event.target.value as ExportRange)}><option value="sequence">Entire sequence</option><option value="selected" disabled={!selectedClip}>Selected clip{selectedClip ? ` · ${selectedClip.name}` : ""}</option></select></label>
             </div>
             {(renderStarting || renderJob) && (
               <div className={`render-status ${renderJob?.stage ?? "starting"}`}>
@@ -2381,17 +2550,15 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
                 <div className="render-progress"><i style={{width: `${renderJob?.progress ?? 1}%`}} /></div>
               </div>
             )}
+            {exportJobs.length > 0 && <div className="export-queue-list"><header><span>Export queue</span><b>{exportJobs.filter((job) => ["queued", "bundling", "rendering", "packaging"].includes(job.stage)).length} active</b></header>{exportJobs.map((job) => <article key={job.id}><div><strong>{job.filename || "Preparing export"}</strong><small>{job.stage} · {Math.round(job.progress)}%{job.attempts ? ` · attempt ${job.attempts}` : ""}</small></div>{job.stage === "complete" && job.downloadUrl ? <a href={job.downloadUrl} download={job.filename}>Download</a> : job.stage === "error" || job.stage === "cancelled" ? <button onClick={() => void fetch(`/api/render/${job.id}/retry`, {method: "POST"}).then((response) => response.json()).then((next: RenderJobStatus) => {setRenderJob(next); setExportJobs((current) => [next, ...current.filter((item) => item.id !== next.id)]);})}>Retry</button> : <button onClick={() => void fetch(`/api/render/${job.id}/cancel`, {method: "POST"}).then((response) => response.json()).then((next: RenderJobStatus) => {setExportJobs((current) => current.map((item) => item.id === next.id ? next : item)); if (renderJob?.id === next.id) setRenderJob(next);})}>Cancel</button>}</article>)}</div>}
             <footer>
               <button className="project-export-button" onClick={exportProjectFile}><Save size={14} /> Project file</button>
               <button className="project-export-button" onClick={() => exportInterchange("edl")} title="Export CMX 3600 edit decision list">EDL</button>
               <button className="project-export-button" onClick={() => exportInterchange("xml")} title="Export Final Cut Pro 7 XML for Premiere Pro and Resolve">XML</button>
               <span />
               {exportIsActive ? <button className="cancel-render-button" onClick={() => void cancelVideoExport()}>Cancel render</button> : null}
-              {renderJob?.stage === "complete" && renderJob.downloadUrl ? (
-                <a className="download-video-button" href={renderJob.downloadUrl} download={renderJob.filename}><Download size={15} /> Download {EXPORT_FORMAT_LABELS[exportFormat].download}</a>
-              ) : (
-                <button className="start-render-button" disabled={renderStarting || exportIsActive} onClick={() => void startVideoExport()}>{renderStarting ? <LoaderCircle className="spinning" size={15} /> : <FileVideo2 size={15} />} {renderJob?.stage === "error" || renderJob?.stage === "cancelled" ? "Try again" : "Render video"}</button>
-              )}
+              {renderJob?.stage === "complete" && renderJob.downloadUrl ? <a className="download-video-button" href={renderJob.downloadUrl} download={renderJob.filename}><Download size={15} /> Download</a> : null}
+              <button className="start-render-button" disabled={renderStarting} onClick={() => void startVideoExport()}>{renderStarting ? <LoaderCircle className="spinning" size={15} /> : <FileVideo2 size={15} />} Queue export</button>
             </footer>
           </section>
         </div>
@@ -2628,9 +2795,29 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
             </div>
           ) : activeLeftTab === "effects" ? (
             <div className="effects-list">
-              <div className="search-row"><Search size={14} /><input placeholder="Search effects" /></div>
+              <div className="search-row"><Search size={14} /><input aria-label="Search visual effects" value={effectsSearch} onChange={(event) => setEffectsSearch(event.target.value)} placeholder="Search 25 effects" /></div>
+              {selectedClip && selectedClip.kind !== "audio" && selectedClip.kind !== "caption" && (selectedClip.visualEffects?.length ?? 0) > 0 ? <div className="visual-effect-stack">
+                <div className="effects-heading">Applied effects · render order</div>
+                {selectedClip.visualEffects?.map((effect) => {
+                  const descriptor = getVisualEffectDescriptor(effect.descriptorId);
+                  return <article key={effect.id} className={effect.enabled ? "" : "disabled"}>
+                    <header><label><input type="checkbox" checked={effect.enabled} onChange={(event) => updateVisualEffect(effect.id, (item) => ({...item, enabled: event.target.checked}))} /><span>{descriptor?.name ?? effect.descriptorId}</span></label><button onClick={() => updateVisualEffect(effect.id, () => null)} title="Remove effect"><X size={12} /></button></header>
+                    {descriptor && <div className="visual-effect-parameters">{Object.entries(descriptor.parameters).map(([key, schema]) => {
+                      const value = effect.parameters[key];
+                      if (schema.type === "boolean") return <label key={key}><span>{key}</span><input type="checkbox" checked={Boolean(value)} onChange={(event) => updateVisualEffect(effect.id, (item) => ({...item, parameters: {...item.parameters, [key]: event.target.checked}}))} /></label>;
+                      if (schema.type === "select") return <label key={key}><span>{key}</span><select value={String(value)} onChange={(event) => updateVisualEffect(effect.id, (item) => ({...item, parameters: {...item.parameters, [key]: event.target.value}}))}>{schema.options.map((option) => <option key={option}>{option}</option>)}</select></label>;
+                      return <label key={key}><span>{key}</span><input type={schema.type === "color" ? "color" : "number"} value={value as string | number} min={schema.type === "number" ? schema.min : undefined} max={schema.type === "number" ? schema.max : undefined} step={schema.type === "number" ? schema.step : undefined} onChange={(event) => updateVisualEffect(effect.id, (item) => ({...item, parameters: {...item.parameters, [key]: schema.type === "number" ? Number(event.target.value) : event.target.value}}))} /></label>;
+                    })}</div>}
+                  </article>;
+                })}
+              </div> : null}
+              {selectedClip && selectedClip.kind !== "audio" && selectedClip.kind !== "caption" ? <div className="object-matte-panel">
+                <div><strong>Object mattes</strong><small>{selectedClip.objectMattes?.length ? `${selectedClip.objectMattes.length} attached` : "No semantic provider installed · import PNG/WebP mattes"}</small></div>
+                <label><Plus size={13} /> Import matte sequence<input className="hidden-input" type="file" multiple accept="image/png,image/webp" onChange={(event) => void importObjectMatte(event)} /></label>
+                {selectedClip.objectMattes?.map((matte) => <article key={matte.id}><label><input type="checkbox" checked={matte.enabled} onChange={(event) => commit((draft) => {const clip = draft.clips.find((item) => item.id === selectedClip.id); const target = clip?.objectMattes?.find((item) => item.id === matte.id); if (target) target.enabled = event.target.checked;}, "Toggled object matte")} /><span>{matte.name}</span></label><small>{matte.frames.length} frames · {matte.source}</small></article>)}
+              </div> : null}
               <div className="effects-heading">Video effects</div>
-              {[{name: "Lumetri Color", icon: SlidersHorizontal, tag: "Color"}, {name: "Gaussian Blur", icon: Sparkles, tag: "Blur"}, {name: "Transform", icon: Maximize2, tag: "Motion"}, {name: "Film Grain", icon: Gauge, tag: "Stylize"}, {name: "Glow", icon: WandSparkles, tag: "Stylize"}].map((effect) => <button key={effect.name} onClick={() => applyVideoEffect(effect.name)}><effect.icon size={16} /><span>{effect.name}<small>{effect.tag}</small></span><Plus size={14} /></button>)}
+              {listVisualEffects(effectsSearch).map((effect) => <button key={effect.id} onClick={() => applyVideoEffect(effect.id)}><Sparkles size={16} /><span>{effect.name}<small>{effect.category} · deterministic preview</small></span><Plus size={14} /></button>)}
               <div className="effects-heading">Video transitions</div>
               {(Object.entries(TRANSITION_NAMES) as Array<[TransitionType, string]>).map(([type, name]) => (
                 <button key={type} onClick={() => addTransition(type)} title={`Apply ${name} to the selected edit point`}>
@@ -2640,19 +2827,13 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
             </div>
           ) : (
             <div className="audio-mixer">
-              <div className="mixer-heading"><span>Track mixer</span><small>Gain · mute · solo</small></div>
-              {project.tracks.filter((track) => track.kind === "audio").map((track) => (
-                <section className={`mixer-channel ${track.muted ? "muted" : ""} ${track.solo ? "solo" : ""}`} key={track.id}>
-                  <header><strong>{track.name}</strong><span>{linearToDb(track.volume).toFixed(1)} dB</span></header>
-                  <div className="mixer-controls">
-                    <button className={track.muted ? "active mute" : ""} onClick={() => toggleTrack(track.id, "muted")} title={`Mute ${track.name}`}>M</button>
-                    <button className={track.solo ? "active solo" : ""} onClick={() => toggleTrack(track.id, "solo")} title={`Solo ${track.name}`}>S</button>
-                    <input aria-label={`${track.name} track volume`} type="range" min="-60" max="12" step="0.5" value={linearToDb(track.volume)} onChange={(event) => updateTrackVolume(track.id, Number(event.target.value))} />
-                  </div>
-                  <div className="mixer-scale"><span>-∞</span><i /><span>0</span><i /><span>+12</span></div>
-                </section>
-              ))}
-              <div className="mixer-tip"><AudioWaveform size={15} /><span>Clip gain and fades are available in the Inspector when an audio or video clip is selected.</span></div>
+              <VoiceoverRecorder onUploaded={addVoiceoverToTimeline} onError={setToast} />
+              <AudioMixerPanel
+                tracks={project.tracks}
+                settings={project.audioSettings}
+                onTracksChange={(tracks) => commit((draft) => {draft.tracks = tracks;}, "Updated audio mixer")}
+                onSettingsChange={(audioSettings) => commit((draft) => {draft.audioSettings = audioSettings;}, "Updated audio bus")}
+              />
             </div>
           )}
         </section>

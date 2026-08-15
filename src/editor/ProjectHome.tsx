@@ -1,4 +1,4 @@
-import React, {useMemo, useRef, useState} from "react";
+import React, {useEffect, useMemo, useRef, useState} from "react";
 import {
   ArchiveRestore,
   Clapperboard,
@@ -27,6 +27,7 @@ import {
   type NewProjectSettings,
   type StoredProject,
 } from "./project-storage";
+import {fetchSharedProject, type SharedProjectSession} from "./collaboration";
 
 const DEFAULT_SETTINGS: NewProjectSettings = {
   name: "Untitled Project",
@@ -57,6 +58,21 @@ export const ProjectHome: React.FC = () => {
   const [query, setQuery] = useState("");
   const [error, setError] = useState<string | null>(null);
   const importInputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    const match = window.location.hash.match(/^#review=([0-9a-f-]{36})\.([A-Za-z0-9_-]+)$/i);
+    if (!match) return;
+    const session: SharedProjectSession = {id: match[1], token: match[2], revision: 0, role: "reviewer"};
+    void fetchSharedProject(session).then((remote) => {
+      const record = createStoredProject(remote.project);
+      window.localStorage.setItem(`directors-shared-session:${record.id}`, JSON.stringify({...session, revision: remote.revision}));
+      window.localStorage.setItem(`directors-review-comments:${record.id}`, JSON.stringify(remote.comments));
+      window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}`);
+      setLibrary(loadProjectLibrary());
+      setActiveProjectId(record.id);
+      setError(null);
+    }).catch((cause) => setError(cause instanceof Error ? cause.message : "The reviewer link could not be opened"));
+  }, []);
 
   const refresh = () => setLibrary(loadProjectLibrary());
   const activeRecord = activeProjectId ? library.projects.find((record) => record.id === activeProjectId) ?? null : null;

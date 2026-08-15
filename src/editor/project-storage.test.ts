@@ -40,6 +40,8 @@ describe("project storage", () => {
     expect(project.media).toEqual([]);
     expect(project.tracks.map((track) => track.id)).toEqual(["c1", "v3", "v2", "v1", "a1", "a2"]);
     expect(project.durationInFrames).toBe(9000);
+    expect(project.audioSettings?.masterBusId).toBe("master");
+    expect(project.audioSettings?.buses.map((bus) => bus.id)).toEqual(["dialogue", "music", "sfx", "master"]);
   });
 
   it("migrates the legacy single-project save exactly once", () => {

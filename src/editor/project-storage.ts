@@ -2,13 +2,14 @@ import {sampleProject} from "./project";
 import {normalizeFrameRate} from "./frame-rate";
 import {normalizeColorGrade} from "./color-math";
 import {createDefaultMask, normalizeEffectMask} from "./masks";
+import {DEFAULT_AUDIO_PROJECT_SETTINGS, normalizeProcessorChain, normalizeProjectAudioSettings, normalizeTrackAudio} from "./audio/project-audio";
 import type {EditorClip, EditorProject, EditorSequence, EditorTrack, ProjectLut} from "./types";
 import {syncActiveSequence} from "./sequences";
 import {DEFAULT_CAPTION_STYLE, DEFAULT_EFFECTS, DEFAULT_TITLE_STYLE} from "./types";
 
 export const PROJECT_LIBRARY_KEY = "infinity-cut-project-library-v2";
 export const LEGACY_PROJECT_KEY = "infinity-cut-project";
-export const PROJECT_SCHEMA_VERSION = 4;
+export const PROJECT_SCHEMA_VERSION = 5;
 
 const MAX_RECOVERY_VERSIONS = 8;
 const RECOVERY_INTERVAL_MS = 30_000;
@@ -63,6 +64,9 @@ const defaultTrack = (id: string, kind: EditorTrack["kind"]): EditorTrack => ({
   muted: false,
   solo: false,
   volume: 1,
+  audioPan: 0,
+  audioBusId: "master",
+  audioProcessors: [],
   hidden: false,
   locked: false,
 });
@@ -86,6 +90,7 @@ export const createBlankProject = ({name, width, height, fps}: NewProjectSetting
   ],
   media: [],
   luts: [],
+  audioSettings: clone(DEFAULT_AUDIO_PROJECT_SETTINGS),
   tracks: [
     defaultTrack("c1", "caption"),
     defaultTrack("v3", "video"),
@@ -132,6 +137,7 @@ export const normalizeProject = (value: unknown): EditorProject => {
       || !Array.isArray(candidate.domainMax) || candidate.domainMax.length !== 3 || typeof candidate.dataBase64 !== "string") return [];
     return [{...candidate, domainMin: [...candidate.domainMin], domainMax: [...candidate.domainMax]} as ProjectLut];
   }) : [];
+  parsed.audioSettings = normalizeProjectAudioSettings(parsed.audioSettings);
 
   const normalizeClip = (clip: EditorClip): EditorClip => {
     const effects = {...DEFAULT_EFFECTS, ...(clip.effects ?? {})};
@@ -151,6 +157,8 @@ export const normalizeProject = (value: unknown): EditorProject => {
       fadeIn: clip.fadeIn ?? 0,
       fadeOut: clip.fadeOut ?? 0,
       audioMuted: clip.audioMuted ?? false,
+      audioPan: typeof clip.audioPan === "number" && Number.isFinite(clip.audioPan) ? Math.max(-1, Math.min(1, clip.audioPan)) : 0,
+      audioProcessors: normalizeProcessorChain(clip.audioProcessors),
       playbackRate: typeof clip.playbackRate === "number" && Number.isFinite(clip.playbackRate) ? Math.max(0.1, Math.min(10, clip.playbackRate)) : 1,
       preservePitch: clip.preservePitch ?? true,
       keyframes: Array.isArray(clip.keyframes) ? clip.keyframes : [],
@@ -160,6 +168,8 @@ export const normalizeProject = (value: unknown): EditorProject => {
       effectMasks: Array.isArray(clip.effectMasks)
         ? clip.effectMasks.map((mask, index) => normalizeEffectMask(mask, `${clip.id}-mask-${index + 1}`))
         : legacyMasks,
+      visualEffects: Array.isArray(clip.visualEffects) ? clip.visualEffects : [],
+      objectMattes: Array.isArray(clip.objectMattes) ? clip.objectMattes : [],
       textStyle: clip.kind === "title"
         ? {...DEFAULT_TITLE_STYLE, ...(clip.textStyle ?? {})}
         : clip.kind === "caption"
@@ -169,7 +179,7 @@ export const normalizeProject = (value: unknown): EditorProject => {
   };
 
   if (!parsed.tracks.some((track) => track.kind === "caption")) parsed.tracks.unshift(defaultTrack("c1", "caption"));
-  parsed.tracks = parsed.tracks.map((track) => ({...track, solo: track.solo ?? false, volume: track.volume ?? 1}));
+  parsed.tracks = parsed.tracks.map((track) => normalizeTrackAudio({...track, solo: track.solo ?? false, volume: track.volume ?? 1}, parsed.audioSettings!));
   parsed.clips = parsed.clips.map(normalizeClip);
   parsed.activeSequenceId = typeof parsed.activeSequenceId === "string" && parsed.activeSequenceId ? parsed.activeSequenceId : "sequence-1";
   parsed.sequences = Array.isArray(parsed.sequences) ? parsed.sequences : [];
@@ -189,7 +199,7 @@ export const normalizeProject = (value: unknown): EditorProject => {
   }
   parsed.sequences = parsed.sequences.map((sequence) => ({
     ...sequence,
-    tracks: Array.isArray(sequence.tracks) ? sequence.tracks.map((track) => ({...track, solo: track.solo ?? false, volume: track.volume ?? 1})) : [],
+    tracks: Array.isArray(sequence.tracks) ? sequence.tracks.map((track) => normalizeTrackAudio({...track, solo: track.solo ?? false, volume: track.volume ?? 1}, parsed.audioSettings!)) : [],
     clips: Array.isArray(sequence.clips) ? sequence.clips.map(normalizeClip) : [],
     markers: Array.isArray(sequence.markers) ? sequence.markers : [],
     transitions: Array.isArray(sequence.transitions) ? sequence.transitions : [],
@@ -208,7 +218,7 @@ const readLibrary = (storage: StorageLike): ProjectLibrary => {
   if (!raw) return emptyLibrary();
   try {
     const parsed = JSON.parse(raw) as ProjectLibrary;
-    if (![2, 3, PROJECT_SCHEMA_VERSION].includes(Number(parsed.schemaVersion)) || !Array.isArray(parsed.projects)) return emptyLibrary();
+    if (![2, 3, 4, PROJECT_SCHEMA_VERSION].includes(Number(parsed.schemaVersion)) || !Array.isArray(parsed.projects)) return emptyLibrary();
     return {
       schemaVersion: PROJECT_SCHEMA_VERSION,
       activeProjectId: typeof parsed.activeProjectId === "string" ? parsed.activeProjectId : null,

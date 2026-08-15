@@ -2,6 +2,9 @@ import React from "react";
 import {AbsoluteFill, Html5Audio, Img, OffthreadVideo, Sequence, staticFile, useCurrentFrame} from "remotion";
 import {getAnimatedPropertyValue} from "./animation";
 import {getClipPlaybackRate} from "./clip-speed";
+import {buildEffectRenderPlan, deterministicEffectNoise, type EffectOverlay} from "./effects/render-plan";
+import type {VisualEffectInstance} from "./effects/registry";
+import {matteFrameAt, objectMatteCss, type ObjectMatteReference} from "./mattes/object-matte";
 import type {ColorCurvePoint, EditorClip, EditorEffectMask, EditorProject, EditorTransition, MaskProperty} from "./types";
 import {DEFAULT_CAPTION_STYLE, DEFAULT_TITLE_STYLE} from "./types";
 import {projectViewForSequence} from "./sequences";
@@ -180,10 +183,67 @@ const resolveMediaSource = (source: string) => /^(?:https?:|blob:|data:)/.test(s
   ? source
   : staticFile(source.replace(/^\//, ""));
 
+type RenderableEditorClip = EditorClip & {
+  visualEffects?: VisualEffectInstance[];
+  objectMattes?: ObjectMatteReference[];
+};
+
+const combineEffectStyle = (style: React.CSSProperties, clip: RenderableEditorClip, localFrame: number) => {
+  const plan = buildEffectRenderPlan(clip.visualEffects, localFrame);
+  return {
+    plan,
+    style: {
+      ...style,
+      filter: [style.filter, plan.filter].filter(Boolean).join(" "),
+      transform: [style.transform, plan.transform].filter(Boolean).join(" "),
+      imageRendering: plan.imageRendering,
+      clipPath: plan.clipPath,
+    } satisfies React.CSSProperties,
+  };
+};
+
+const EffectOverlayLayer: React.FC<{overlay: EffectOverlay; localFrame: number; renderMedia: (style: React.CSSProperties, withAudio: boolean) => React.ReactNode}> = ({overlay, localFrame, renderMedia}) => {
+  const p = overlay.parameters;
+  const n = (key: string) => Number(p[key] ?? 0);
+  const s = (key: string) => String(p[key] ?? "");
+  if (overlay.kind === "tint") return <AbsoluteFill style={{backgroundColor: s("color"), opacity: n("amount"), mixBlendMode: "color"}} />;
+  if (overlay.kind === "duotone") return <AbsoluteFill style={{background: `linear-gradient(135deg, ${s("shadow")}, ${s("highlight")})`, opacity: n("amount"), mixBlendMode: "color"}} />;
+  if (overlay.kind === "progressive-blur") {
+    const direction = s("direction");
+    const gradient = direction === "top" ? "to top" : direction === "right" ? "to right" : direction === "left" ? "to left" : "to bottom";
+    return <AbsoluteFill style={{WebkitMaskImage: `linear-gradient(${gradient}, transparent, black)`, maskImage: `linear-gradient(${gradient}, transparent, black)`}}>{renderMedia({position: "absolute", inset: 0, width: "100%", height: "100%", filter: `blur(${n("radius")}px)`, transform: "scale(1.04)"}, false)}</AbsoluteFill>;
+  }
+  if (overlay.kind === "zoom-blur") return <AbsoluteFill style={{transformOrigin: `${n("centerX") * 100}% ${n("centerY") * 100}%`, opacity: Math.min(.7, n("amount"))}}>{[1.01, 1.025, 1.045].map((scale, index) => <React.Fragment key={scale}>{renderMedia({position: "absolute", inset: 0, width: "100%", height: "100%", transform: `scale(${scale})`, opacity: n("amount") / (index + 2), mixBlendMode: "screen"}, false)}</React.Fragment>)}</AbsoluteFill>;
+  if (overlay.kind === "halftone") {
+    const size = Math.max(2, n("size"));
+    return <AbsoluteFill style={{backgroundImage: "radial-gradient(circle, rgba(0,0,0,.75) 0 28%, transparent 31%)", backgroundSize: `${size}px ${size}px`, transform: `rotate(${n("angle")}deg) scale(1.5)`, opacity: .34, mixBlendMode: "overlay"}} />;
+  }
+  if (overlay.kind === "scanlines") return <AbsoluteFill style={{backgroundImage: `repeating-linear-gradient(0deg, rgba(0,0,0,${n("opacity")}) 0 1px, transparent 1px ${Math.max(2, n("spacing"))}px)`, mixBlendMode: "multiply"}} />;
+  if (overlay.kind === "chromatic") {
+    const amount = n("amount");
+    return <AbsoluteFill style={{opacity: .42, mixBlendMode: "screen"}}>{renderMedia({position: "absolute", inset: 0, width: "100%", height: "100%", transform: `translateX(${-amount}px)`, filter: "sepia(1) saturate(8) hue-rotate(300deg)"}, false)}{renderMedia({position: "absolute", inset: 0, width: "100%", height: "100%", transform: `translateX(${amount}px)`, filter: "sepia(1) saturate(8) hue-rotate(140deg)"}, false)}</AbsoluteFill>;
+  }
+  if (overlay.kind === "noise") {
+    const amount = n("amount");
+    const seed = n("seed");
+    return <AbsoluteFill style={{opacity: amount, mixBlendMode: "overlay"}}>{Array.from({length: 96}, (_, index) => <i key={index} style={{position: "absolute", left: `${deterministicEffectNoise(seed, localFrame, index) * 100}%`, top: `${deterministicEffectNoise(seed, localFrame, index + 101) * 100}%`, width: 2 + deterministicEffectNoise(seed, localFrame, index + 202) * 5, height: 2 + deterministicEffectNoise(seed, localFrame, index + 202) * 5, backgroundColor: p.monochrome === false ? `hsl(${deterministicEffectNoise(seed, localFrame, index + 303) * 360} 80% 60%)` : index % 2 ? "white" : "black"}} />)}</AbsoluteFill>;
+  }
+  if (overlay.kind === "paper") return <AbsoluteFill style={{backgroundImage: "repeating-radial-gradient(ellipse at 30% 20%, rgba(112,82,44,.18) 0 1px, transparent 1px 4px)", backgroundSize: `${8 + deterministicEffectNoise(n("seed"), localFrame, 1) * 5}px ${7 + deterministicEffectNoise(n("seed"), localFrame, 2) * 4}px`, opacity: n("amount"), mixBlendMode: "multiply"}} />;
+  if (overlay.kind === "light-leak") {
+    const phase = (n("progress") + localFrame / 180 + deterministicEffectNoise(n("seed"), 0, 1)) % 1;
+    return <AbsoluteFill style={{background: `radial-gradient(circle at ${phase * 120 - 10}% ${30 + phase * 40}%, rgba(255,245,174,.92), rgba(255,74,36,.55) 24%, transparent 62%)`, opacity: n("opacity"), mixBlendMode: "screen"}} />;
+  }
+  return null;
+};
+
+const EffectFailureBadge: React.FC<{errors: string[]}> = ({errors}) => errors.length ? <div style={{position: "absolute", zIndex: 50, left: 22, top: 22, maxWidth: "72%", padding: "10px 14px", border: "2px solid #ff4f76", borderRadius: 6, background: "rgba(38,3,13,.92)", color: "#ffd5df", font: "700 16px Inter, Arial, sans-serif", boxShadow: "0 8px 28px rgba(0,0,0,.48)"}}>EFFECT RENDER ERROR · {errors.join(" · ")}</div> : null;
+
 const VisualClip: React.FC<{clip: EditorClip; frameOffset: number; audioMultiplier: number; offline?: boolean; mediaName?: string; incoming?: EditorTransition; outgoing?: EditorTransition}> = ({clip, frameOffset, audioMultiplier, offline, mediaName, incoming, outgoing}) => {
+  const renderableClip = clip as RenderableEditorClip;
   const localFrame = useCurrentFrame() + frameOffset;
   const gradeFilterId = clip.colorGrade ? `grade-${clip.id.replace(/[^a-zA-Z0-9_-]/g, "-")}` : undefined;
-  const style = visualStyle(clip, localFrame, true, gradeFilterId);
+  const legacyStyle = visualStyle(clip, localFrame, true, gradeFilterId);
+  const {plan: effectPlan, style} = combineEffectStyle(legacyStyle, renderableClip, localFrame);
   const baseStyle = visualStyle(clip, localFrame, false);
   const incomingActive = incoming && localFrame <= Math.ceil(incoming.duration / 2);
   const outgoingActive = outgoing && localFrame >= clip.duration - Math.floor(outgoing.duration / 2);
@@ -207,6 +267,7 @@ const VisualClip: React.FC<{clip: EditorClip; frameOffset: number; audioMultipli
     if (clip.kind === "image" && clip.src) return <Img src={resolveMediaSource(clip.src)} style={{...mediaStyle, objectFit: "cover"}} />;
     return null;
   };
+  const effectOverlays = effectPlan.overlays.map((overlay) => <EffectOverlayLayer key={overlay.id} overlay={overlay} localFrame={localFrame} renderMedia={renderMedia} />);
   const content = (() => {
   if (offline) {
     return (
@@ -220,7 +281,7 @@ const VisualClip: React.FC<{clip: EditorClip; frameOffset: number; audioMultipli
   }
   if ((clip.kind === "video" || clip.kind === "image") && clip.src) {
     if (maskedTreatment) {
-      return <><AdvancedGradeFilter clip={clip} id={gradeFilterId ?? `grade-${clip.id}`} />{renderMedia(baseStyle, true)}<AbsoluteFill style={effectMaskStyle(clip, localFrame)}>{renderMedia(style, false)}<TreatmentOverlays clip={clip} localFrame={localFrame} /></AbsoluteFill></>;
+      return <><AdvancedGradeFilter clip={clip} id={gradeFilterId ?? `grade-${clip.id}`} />{renderMedia(baseStyle, true)}<AbsoluteFill style={effectMaskStyle(clip, localFrame)}>{renderMedia(style, false)}<TreatmentOverlays clip={clip} localFrame={localFrame} />{effectOverlays}</AbsoluteFill></>;
     }
     return <><AdvancedGradeFilter clip={clip} id={gradeFilterId ?? `grade-${clip.id}`} />{renderMedia(style, true)}</>;
   }
@@ -267,7 +328,9 @@ const VisualClip: React.FC<{clip: EditorClip; frameOffset: number; audioMultipli
   return null;
   })();
 
-  return <AbsoluteFill style={{overflow: "hidden", ...wrapperStyle}}>{content}{!offline && !maskedTreatment && <TreatmentOverlays clip={clip} localFrame={localFrame} />}</AbsoluteFill>;
+  const enabledMatte = renderableClip.objectMattes?.find((matte) => matte.enabled);
+  const matteMissing = enabledMatte && !matteFrameAt(enabledMatte, localFrame);
+  return <AbsoluteFill data-editor-clip-id={clip.id} data-editor-track-id={clip.trackId} style={{overflow: "hidden", ...wrapperStyle}}><AbsoluteFill style={enabledMatte ? objectMatteCss(enabledMatte, localFrame) : undefined}>{content}{!offline && !maskedTreatment && <TreatmentOverlays clip={clip} localFrame={localFrame} />}{!offline && !maskedTreatment && effectOverlays}</AbsoluteFill><EffectFailureBadge errors={[...effectPlan.errors, ...(matteMissing ? [`Object matte has no frame: ${enabledMatte.name}`] : [])]} /></AbsoluteFill>;
 };
 
 const EditorTimeline: React.FC<EditorCompositionProps & {ancestors: string[]}> = ({project, ancestors}) => {
@@ -308,6 +371,7 @@ const EditorTimeline: React.FC<EditorCompositionProps & {ancestors: string[]}> =
           const trackMultiplier = trackAudible ? (track?.volume ?? 1) : 0;
           return (
             <Sequence key={clip.id} from={clip.start} durationInFrames={clip.duration}>
+              <div data-editor-clip-id={clip.id} data-editor-track-id={clip.trackId}>
               <Html5Audio
                 src={resolveMediaSource(clip.src)}
                 trimBefore={clip.sourceStart}
@@ -316,6 +380,7 @@ const EditorTimeline: React.FC<EditorCompositionProps & {ancestors: string[]}> =
                 pauseWhenBuffering={false}
                 volume={(frame) => clipAudioVolume(clip, frame) * trackMultiplier}
               />
+              </div>
             </Sequence>
           );
         }
