@@ -112,7 +112,9 @@ export class SharedProjectStore {
       const record = await this.read(id);
       if (tokenRole(record, token) !== "editor") throw Object.assign(new Error("Editor access is required"), {status: 403});
       if (!Array.isArray(comments) || comments.length > 10_000) throw Object.assign(new Error("Invalid review comments"), {status: 400});
-      const next = {...record, comments, updatedAt: Date.now()};
+      const incomingIds = new Set(comments.map((comment) => comment.id));
+      const mergedComments = [...comments, ...record.comments.filter((comment) => !incomingIds.has(comment.id))].slice(0, 10_000);
+      const next = {...record, comments: mergedComments, updatedAt: Date.now()};
       await this.atomicWrite(next);
       return next;
     });

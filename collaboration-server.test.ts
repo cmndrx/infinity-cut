@@ -23,6 +23,8 @@ describe("private shared project store", () => {
     const commented = await store.appendComment(record.id, reviewerToken, reviewerComment);
     expect(commented.comments[0].author).toBe("Reviewer");
     await expect(store.replaceComments(record.id, reviewerToken, [])).rejects.toMatchObject({status: 403});
+    const merged = await store.replaceComments(record.id, token, []);
+    expect(merged.comments.map((comment) => comment.id)).toContain("review-1");
 
     const persisted = JSON.parse(await readFile(path.join(directory, `${record.id}.json`), "utf8")) as {editorTokenHash: string; reviewerTokenHash: string; token?: string; versions: unknown[]};
     expect(persisted.token).toBeUndefined();
