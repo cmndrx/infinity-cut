@@ -3,13 +3,16 @@ import {normalizeFrameRate} from "./frame-rate";
 import {normalizeColorGrade} from "./color-math";
 import {createDefaultMask, normalizeEffectMask} from "./masks";
 import {DEFAULT_AUDIO_PROJECT_SETTINGS, normalizeProcessorChain, normalizeProjectAudioSettings, normalizeTrackAudio} from "./audio/project-audio";
+import {normalizeMediaProxy} from "./proxy";
+import {normalizeMediaAnalysis} from "./media-analysis";
+import {normalizeRenderCache} from "./render-cache";
 import type {EditorClip, EditorProject, EditorSequence, EditorTrack, ProjectLut} from "./types";
 import {syncActiveSequence} from "./sequences";
 import {DEFAULT_CAPTION_STYLE, DEFAULT_EFFECTS, DEFAULT_TITLE_STYLE} from "./types";
 
 export const PROJECT_LIBRARY_KEY = "infinity-cut-project-library-v2";
 export const LEGACY_PROJECT_KEY = "infinity-cut-project";
-export const PROJECT_SCHEMA_VERSION = 5;
+export const PROJECT_SCHEMA_VERSION = 7;
 
 const MAX_RECOVERY_VERSIONS = 8;
 const RECOVERY_INTERVAL_MS = 30_000;
@@ -127,6 +130,8 @@ export const normalizeProject = (value: unknown): EditorProject => {
     offline: item.offline ?? (item.renderReady === false && item.src.startsWith("blob:")),
     fps: normalizeFrameRate(item.fps),
     durationInSeconds: typeof item.durationInSeconds === "number" && Number.isFinite(item.durationInSeconds) && item.durationInSeconds > 0 ? item.durationInSeconds : undefined,
+    proxy: normalizeMediaProxy(item.proxy),
+    analysis: normalizeMediaAnalysis(item.analysis),
   }));
   parsed.luts = Array.isArray(parsed.luts) ? parsed.luts.flatMap((lut) => {
     if (!lut || typeof lut !== "object") return [];
@@ -138,6 +143,7 @@ export const normalizeProject = (value: unknown): EditorProject => {
     return [{...candidate, domainMin: [...candidate.domainMin], domainMax: [...candidate.domainMax]} as ProjectLut];
   }) : [];
   parsed.audioSettings = normalizeProjectAudioSettings(parsed.audioSettings);
+  parsed.renderCache = normalizeRenderCache(parsed.renderCache);
 
   const normalizeClip = (clip: EditorClip): EditorClip => {
     const effects = {...DEFAULT_EFFECTS, ...(clip.effects ?? {})};
@@ -218,7 +224,7 @@ const readLibrary = (storage: StorageLike): ProjectLibrary => {
   if (!raw) return emptyLibrary();
   try {
     const parsed = JSON.parse(raw) as ProjectLibrary;
-    if (![2, 3, 4, PROJECT_SCHEMA_VERSION].includes(Number(parsed.schemaVersion)) || !Array.isArray(parsed.projects)) return emptyLibrary();
+    if (![2, 3, 4, 5, 6, PROJECT_SCHEMA_VERSION].includes(Number(parsed.schemaVersion)) || !Array.isArray(parsed.projects)) return emptyLibrary();
     return {
       schemaVersion: PROJECT_SCHEMA_VERSION,
       activeProjectId: typeof parsed.activeProjectId === "string" ? parsed.activeProjectId : null,

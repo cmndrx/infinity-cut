@@ -2,7 +2,7 @@ import {describe, expect, it} from "vitest";
 import {createBlankProject} from "../project-storage";
 import type {EditorClip, EditorProject} from "../types";
 import {DEFAULT_EFFECTS, DEFAULT_TITLE_STYLE, DEFAULT_TRANSFORM} from "../types";
-import {cloneClips, executeTimelineCommand, moveClips, placeMedia, retimeClip, rippleDelete, splitClip, trimClip, type CommandResult, type CommandSuccess} from "./commands";
+import {cloneClips, editTimelineRange, executeTimelineCommand, moveClips, placeMedia, retimeClip, rippleDelete, splitClip, trimClip, type CommandResult, type CommandSuccess} from "./commands";
 
 const clip = (updates: Partial<EditorClip> = {}): EditorClip => ({
   id: "video",
@@ -161,6 +161,54 @@ describe("timeline commands", () => {
     const value = project();
     value.clips = [clip({id: "delete", start: 0, duration: 10}), clip({id: "overlap", start: 5, duration: 10})];
     expect(rippleDelete(value, ["delete"], false)).toMatchObject({ok: false, error: {code: "LINKED_OPERATION_CONFLICT", entityId: "overlap"}});
+  });
+
+  it("lifts a timeline range while preserving the gap and source/keyframe offsets", () => {
+    const value = project();
+    value.durationInFrames = 80;
+    value.clips = [clip({
+      id: "long",
+      start: 0,
+      duration: 40,
+      sourceStart: 10,
+      playbackRate: 2,
+      keyframes: [
+        {id: "left-key", property: "transform.opacity", frame: 5, value: 25, easing: "linear"},
+        {id: "right-key", property: "transform.opacity", frame: 30, value: 75, easing: "linear"},
+      ],
+    })];
+    const result = successful(editTimelineRange(value, {mode: "lift", inFrame: 10, outFrame: 20, trackIds: ["v1"], idBase: "lift", includeLinked: false}));
+    expect(result.project.clips).toHaveLength(2);
+    expect(result.project.clips[0]).toMatchObject({id: "long", start: 0, duration: 10, sourceStart: 10});
+    expect(result.project.clips[0].keyframes).toEqual([expect.objectContaining({id: "left-key", frame: 5})]);
+    expect(result.project.clips[1]).toMatchObject({id: "lift-long-right", start: 20, duration: 20, sourceStart: 50});
+    expect(result.project.clips[1].keyframes).toEqual([expect.objectContaining({frame: 10, value: 75})]);
+  });
+
+  it("extracts a targeted range and closes the gap across downstream linked clips", () => {
+    const value = project();
+    value.durationInFrames = 80;
+    value.clips = [
+      clip({id: "remove", start: 10, duration: 10}),
+      clip({id: "later-video", start: 30, duration: 10, linkedGroupId: "later"}),
+      clip({id: "later-audio", kind: "audio", trackId: "a1", start: 30, duration: 10, linkedGroupId: "later"}),
+    ];
+    const result = successful(editTimelineRange(value, {mode: "extract", inFrame: 10, outFrame: 20, trackIds: ["v1"], idBase: "extract"}));
+    expect(result.removedClipIds).toEqual(["remove"]);
+    expect(result.project.clips.map((item) => [item.id, item.start])).toEqual([["later-video", 20], ["later-audio", 20]]);
+  });
+
+  it("fails a linked range edit atomically when an affected linked track is locked", () => {
+    const value = project();
+    value.clips = [
+      clip({id: "video", linkedGroupId: "av"}),
+      clip({id: "audio", kind: "audio", trackId: "a1", linkedGroupId: "av"}),
+    ];
+    const audioTrack = value.tracks.find((track) => track.id === "a1");
+    if (audioTrack) audioTrack.locked = true;
+    const result = editTimelineRange(value, {mode: "lift", inFrame: 5, outFrame: 10, trackIds: ["v1"], idBase: "locked"});
+    expect(result).toMatchObject({ok: false, error: {code: "TRACK_LOCKED", entityId: "a1"}});
+    expect(result.project).toEqual(value);
   });
 
   it("retimes linked clips, ripples trailing media, and round-trips through its inverse", () => {

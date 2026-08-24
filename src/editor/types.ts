@@ -229,6 +229,36 @@ export type MediaBin = {
   name: string;
 };
 
+export type MediaProxy = {
+  id: string;
+  status: "queued" | "processing" | "ready" | "error";
+  url?: string;
+  width?: number;
+  height?: number;
+  fileSize?: number;
+  generatedAt?: number;
+  error?: string;
+};
+
+export type MediaAnalysis = {
+  id: string;
+  status: "queued" | "processing" | "ready" | "error";
+  thumbnailUrl?: string;
+  waveform?: number[];
+  generatedAt?: number;
+  error?: string;
+};
+
+export type TimelineRenderCache = {
+  id: string;
+  fingerprint: string;
+  status: "queued" | "rendering" | "ready" | "error";
+  url?: string;
+  generatedAt?: number;
+  fileSize?: number;
+  error?: string;
+};
+
 export type ProjectMedia = {
   id: string;
   name: string;
@@ -248,6 +278,8 @@ export type ProjectMedia = {
   fingerprint?: string;
   renderReady?: boolean;
   offline?: boolean;
+  proxy?: MediaProxy;
+  analysis?: MediaAnalysis;
 };
 
 export type EditorMarker = {
@@ -291,6 +323,7 @@ export type EditorProject = {
   media: ProjectMedia[];
   luts?: ProjectLut[];
   audioSettings?: ProjectAudioSettings;
+  renderCache?: TimelineRenderCache;
   activeSequenceId: string;
   sequences: EditorSequence[];
 };

@@ -9,6 +9,9 @@ import {makeCancelSignal, renderFrames, renderMedia, selectComposition, type Aud
 import type {Connect, Plugin} from "vite";
 import {PersistentExportQueue, type StoredExportJob} from "./server/export-queue";
 import {writeStoredZip} from "./server/zip";
+import {ProxyManager} from "./server/proxy-manager";
+import {MediaAnalysisManager, type AnalysisKind} from "./server/media-analysis-manager";
+import {RenderCacheManager} from "./server/render-cache-manager";
 import type {EditorProject} from "./src/editor/types";
 import {buildProjectAudioMix} from "./src/editor/audio/project-audio";
 import {buildFfmpegAudioGraph} from "./src/editor/audio/ffmpeg-filter-graph";
@@ -59,6 +62,18 @@ const readJson = async (request: import("node:http").IncomingMessage) => {
   return JSON.parse(Buffer.concat(chunks).toString("utf8")) as RenderRequest;
 };
 
+const readSmallJson = async <T,>(request: import("node:http").IncomingMessage): Promise<T> => {
+  const chunks: Buffer[] = [];
+  let size = 0;
+  for await (const chunk of request) {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    size += buffer.length;
+    if (size > 32 * 1024) throw new Error("Request exceeds the 32 KB limit");
+    chunks.push(buffer);
+  }
+  return JSON.parse(Buffer.concat(chunks).toString("utf8")) as T;
+};
+
 const safeFilename = (value: string) => value
   .normalize("NFKD")
   .replace(/[^a-zA-Z0-9._-]+/g, "-")
@@ -103,6 +118,9 @@ export const directorsCutProRenderPlugin = (): Plugin => {
   const install = (middlewares: Connect.Server, root: string) => {
     const dataDir = path.join(root, ".infinity-cut");
     const mediaDir = path.join(dataDir, "media");
+    const proxyDir = path.join(dataDir, "proxies");
+    const analysisDir = path.join(dataDir, "analysis");
+    const cacheDir = path.join(dataDir, "render-cache");
     const renderDir = path.join(dataDir, "renders");
     const mediaSourcePath = (src: string) => {
       const local = src.match(/^\/api\/media\/([a-f0-9-]+)\/([^/?#]+)/i);
@@ -110,6 +128,34 @@ export const directorsCutProRenderPlugin = (): Plugin => {
       if (/^https?:\/\//i.test(src) || path.isAbsolute(src)) return src;
       return path.join(root, "public", src.replace(/^\/+/, ""));
     };
+    const proxySourcePath = (src: string) => {
+      if (src.match(/^\/api\/media\/[a-f0-9-]+\/[^/?#]+$/i)) return mediaSourcePath(src);
+      if (/^https?:\/\//i.test(src) || path.isAbsolute(src) && !src.startsWith("/")) throw new Error("Only locally staged media can be proxied");
+      const publicRoot = path.resolve(root, "public");
+      const resolved = path.resolve(publicRoot, src.replace(/^\/+/, ""));
+      if (resolved !== publicRoot && !resolved.startsWith(`${publicRoot}${path.sep}`)) throw new Error("Proxy source escapes the public media directory");
+      return resolved;
+    };
+    const proxyManager = new ProxyManager(proxyDir, proxySourcePath);
+    const analysisManager = new MediaAnalysisManager(analysisDir, proxySourcePath);
+    const renderCacheManager = new RenderCacheManager(cacheDir, async (project, output) => {
+      if (!bundlePromise) {
+        bundlePromise = bundle({entryPoint: path.join(root, "src/index.ts"), publicDir: path.join(root, "public")}).catch((error) => {
+          bundlePromise = null;
+          throw error;
+        });
+      }
+      const serveUrl = await bundlePromise;
+      const silentProject = {...project, renderCache: undefined, tracks: project.tracks.map((track) => ({...track, muted: true, solo: false})), clips: project.clips.map((clip) => ({...clip, audioMuted: true}))};
+      const inputProps = {project: silentProject};
+      const composition = await selectComposition({serveUrl, id: "DirectorsCutProExport", inputProps, logLevel: "warn"});
+      await renderMedia({
+        codec: "h264", composition, serveUrl, inputProps, outputLocation: output, overwrite: true,
+        crf: 24, scale: Math.min(1, 1280 / project.width), imageFormat: "jpeg", jpegQuality: 82,
+        audioCodec: "aac", audioBitrate: "128k", pixelFormat: "yuv420p", x264Preset: "veryfast",
+        hardwareAcceleration: "if-possible", logLevel: "warn",
+      });
+    });
     const runFfmpeg = (args: string[], signal: AbortSignal) => new Promise<void>((resolve, reject) => {
       const child = spawn("ffmpeg", args, {stdio: ["ignore", "ignore", "pipe"]});
       let stderr = "";
@@ -284,6 +330,137 @@ export const directorsCutProRenderPlugin = (): Plugin => {
         } catch (error) {
           await unlink(filePath).catch(() => undefined);
           return sendJson(response, 500, {error: error instanceof Error ? error.message : "Media upload failed"});
+        }
+      }
+
+      if (request.method === "POST" && url.pathname === "/api/proxies") {
+        try {
+          const body = await readSmallJson<{src?: unknown}>(request);
+          if (typeof body.src !== "string" || !body.src.trim()) return sendJson(response, 400, {error: "A local media source is required"});
+          return sendJson(response, 202, await proxyManager.start(body.src));
+        } catch (error) {
+          return sendJson(response, 400, {error: error instanceof Error ? error.message : "Proxy request failed"});
+        }
+      }
+
+      if (request.method === "POST" && url.pathname === "/api/media-analysis") {
+        try {
+          const body = await readSmallJson<{src?: unknown; kind?: unknown}>(request);
+          if (typeof body.src !== "string" || !body.src.trim()) return sendJson(response, 400, {error: "A local media source is required"});
+          if (!(["video", "audio", "image"] as unknown[]).includes(body.kind)) return sendJson(response, 400, {error: "Media kind must be video, audio, or image"});
+          return sendJson(response, 202, await analysisManager.start(body.src, body.kind as AnalysisKind));
+        } catch (error) {
+          return sendJson(response, 400, {error: error instanceof Error ? error.message : "Media analysis request failed"});
+        }
+      }
+
+      const analysisMatch = url.pathname.match(/^\/api\/media-analysis\/([a-f0-9]{24})(?:\/thumbnail\.jpg)?$/i);
+      if (analysisMatch) {
+        if (request.method === "DELETE" && !url.pathname.endsWith("/thumbnail.jpg")) {
+          await analysisManager.remove(analysisMatch[1]);
+          response.statusCode = 204;
+          return response.end();
+        }
+        if (request.method === "GET" && url.pathname.endsWith("/thumbnail.jpg")) {
+          const status = await analysisManager.status(analysisMatch[1]);
+          if (status?.status !== "ready" || !status.thumbnailUrl) return sendJson(response, 404, {error: "Thumbnail is not ready"});
+          const filePath = analysisManager.thumbnailPath(analysisMatch[1]);
+          const file = await stat(filePath).catch(() => null);
+          if (!file) return sendJson(response, 404, {error: "Thumbnail was not found"});
+          response.statusCode = 200;
+          response.setHeader("Content-Type", "image/jpeg");
+          response.setHeader("Content-Length", file.size);
+          response.setHeader("Cache-Control", "private, max-age=31536000, immutable");
+          createReadStream(filePath).pipe(response);
+          return;
+        }
+        if (request.method === "GET") {
+          const status = await analysisManager.status(analysisMatch[1]);
+          return status ? sendJson(response, 200, status) : sendJson(response, 404, {error: "Media analysis job not found"});
+        }
+      }
+
+      if (request.method === "POST" && url.pathname === "/api/render-cache") {
+        try {
+          const body = await readJson(request);
+          if (!body.project || !Array.isArray(body.project.clips) || !Array.isArray(body.project.tracks)) return sendJson(response, 400, {error: "A valid project is required"});
+          return sendJson(response, 202, await renderCacheManager.start(body.project));
+        } catch (error) {
+          return sendJson(response, 400, {error: error instanceof Error ? error.message : "Timeline cache request failed"});
+        }
+      }
+
+      const cacheMatch = url.pathname.match(/^\/api\/render-cache\/(cache-[a-f0-9]{8})(?:\/preview\.mp4)?$/i);
+      if (cacheMatch) {
+        if (request.method === "DELETE" && !url.pathname.endsWith("/preview.mp4")) {
+          await renderCacheManager.remove(cacheMatch[1]);
+          response.statusCode = 204;
+          return response.end();
+        }
+        if (request.method === "GET" && url.pathname.endsWith("/preview.mp4")) {
+          const status = await renderCacheManager.status(cacheMatch[1]);
+          if (status?.status !== "ready") return sendJson(response, 404, {error: "Timeline cache is not ready"});
+          const filePath = renderCacheManager.outputPath(cacheMatch[1]);
+          const file = await stat(filePath).catch(() => null);
+          if (!file) return sendJson(response, 404, {error: "Timeline cache was not found"});
+          response.statusCode = 200;
+          response.setHeader("Content-Type", "video/mp4");
+          response.setHeader("Accept-Ranges", "bytes");
+          response.setHeader("Cache-Control", "private, max-age=31536000, immutable");
+          const range = request.headers.range?.match(/^bytes=(\d*)-(\d*)$/);
+          if (range) {
+            const start = Math.max(0, Math.min(file.size - 1, range[1] ? Number(range[1]) : 0));
+            const end = Math.max(start, Math.min(file.size - 1, range[2] ? Number(range[2]) : file.size - 1));
+            response.statusCode = 206;
+            response.setHeader("Content-Range", `bytes ${start}-${end}/${file.size}`);
+            response.setHeader("Content-Length", end - start + 1);
+            createReadStream(filePath, {start, end}).pipe(response);
+            return;
+          }
+          response.setHeader("Content-Length", file.size);
+          createReadStream(filePath).pipe(response);
+          return;
+        }
+        if (request.method === "GET") {
+          const status = await renderCacheManager.status(cacheMatch[1]);
+          return status ? sendJson(response, 200, status) : sendJson(response, 404, {error: "Timeline cache job not found"});
+        }
+      }
+
+      const proxyMatch = url.pathname.match(/^\/api\/proxies\/([a-f0-9]{24})(?:\/proxy\.mp4)?$/i);
+      if (proxyMatch) {
+        if (request.method === "DELETE") {
+          await proxyManager.remove(proxyMatch[1]);
+          response.statusCode = 204;
+          return response.end();
+        }
+        if (request.method === "GET" && url.pathname.endsWith("/proxy.mp4")) {
+          const status = await proxyManager.status(proxyMatch[1]);
+          if (status?.status !== "ready") return sendJson(response, 404, {error: "Proxy media is not ready"});
+          const filePath = path.join(proxyDir, `${proxyMatch[1]}.mp4`);
+          const file = await stat(filePath).catch(() => null);
+          if (!file) return sendJson(response, 404, {error: "Proxy media was not found"});
+          response.statusCode = 200;
+          response.setHeader("Content-Type", "video/mp4");
+          response.setHeader("Accept-Ranges", "bytes");
+          response.setHeader("Cache-Control", "private, max-age=31536000, immutable");
+          const range = request.headers.range?.match(/^bytes=(\d*)-(\d*)$/);
+          if (range) {
+            const start = Math.max(0, Math.min(file.size - 1, range[1] ? Number(range[1]) : 0));
+            const end = Math.max(start, Math.min(file.size - 1, range[2] ? Number(range[2]) : file.size - 1));
+            response.statusCode = 206;
+            response.setHeader("Content-Range", `bytes ${start}-${end}/${file.size}`);
+            response.setHeader("Content-Length", end - start + 1);
+            createReadStream(filePath, {start, end}).pipe(response);
+            return;
+          }
+          response.setHeader("Content-Length", file.size);
+          createReadStream(filePath).pipe(response);
+          return;
+        }
+        if (request.method === "GET") {
+          const status = await proxyManager.status(proxyMatch[1]);
+          return status ? sendJson(response, 200, status) : sendJson(response, 404, {error: "Proxy job not found"});
         }
       }
 

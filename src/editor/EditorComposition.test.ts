@@ -13,7 +13,7 @@ describe("editor video playback", () => {
   it("keeps Player input props stable while the transport timecode updates", () => {
     const source = readFileSync("src/editor/App.tsx", "utf8");
 
-    expect(source).toContain("const playerInputProps = useMemo(() => ({project}), [project]);");
+    expect(source).toContain("const playerInputProps = useMemo(() => ({project, useProxies, useRenderCache}), [project, useProxies, useRenderCache]);");
     expect(source).toContain("inputProps={playerInputProps}");
     expect(source).not.toContain("inputProps={{project}}");
   });

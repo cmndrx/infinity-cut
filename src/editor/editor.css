@@ -335,6 +335,12 @@ button { color: inherit; }
 .monitor-heading { height: 33px; display: flex; align-items: stretch; justify-content: space-between; border-bottom: 1px solid #282b32; background: #111318; }
 .monitor-heading > div:last-child { display: flex; align-items: center; padding-right: 7px; }
 .monitor-heading > div:last-child button { display: flex; align-items: center; gap: 3px; border: 0; background: transparent; color: #69707c; font-size: 9px; }
+.monitor-heading > div:last-child .proxy-preview-toggle { height: 24px; padding: 0 7px; margin-right: 3px; border: 1px solid #30343d; border-radius: 4px; color: #858c97; background: #15181d; font-size: 8px; font-weight: 650; }
+.monitor-heading > div:last-child .proxy-preview-toggle.active { border-color: #4e776a; color: #c5f3df; background: #183027; }
+.monitor-heading > div:last-child .cache-preview-toggle { width: auto; height: 24px; padding: 0 7px; margin-right: 3px; border: 1px solid #30343d; border-radius: 4px; display: inline-flex; align-items: center; gap: 4px; color: #858c97; background: #15181d; font-size: 8px; font-weight: 650; white-space: nowrap; }
+.monitor-heading > div:last-child .cache-preview-toggle.active { border-color: #66549b; color: #e3d9ff; background: #29203f; }
+.monitor-heading > div:last-child .cache-preview-toggle.working { border-color: #594d78; color: #d8cbfa; background: #211b30; }
+.proxy-preview-toggle i { min-width: 13px; height: 13px; padding: 0 3px; border-radius: 7px; display: grid; place-items: center; color: #07120e; background: #79d9b2; font-size: 7px; font-style: normal; }
 .monitor-tabs { display: flex; min-width: 0; }
 .monitor-tabs button { max-width: 220px; padding: 0 12px; overflow: hidden; border: 0; border-right: 1px solid #292c33; border-bottom: 2px solid transparent; background: #0d0f13; color: #737a86; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
 .monitor-tabs button.active { border-bottom-color: #9b7cff; background: #15131d; color: #ddd6f5; }
@@ -352,6 +358,8 @@ button { color: inherit; }
 .source-controls button { height: 25px; padding: 0 7px; display: flex; align-items: center; gap: 4px; border: 1px solid #2b2f38; border-radius: 4px; background: #14171c; color: #9299a5; font-size: 8px; }
 .source-controls button:hover { border-color: #5e536f; color: #e1d8fa; }
 .source-controls .play-button { width: 28px; justify-content: center; padding: 0; border-radius: 50%; color: #fff; background: #282d36; }
+.source-controls .shuttle { width: 23px; justify-content: center; padding: 0; font-size: 8px; font-weight: 800; }
+.source-controls .shuttle.active { border-color: #8f73e4; color: white; background: #493476; box-shadow: inset 0 0 0 1px rgba(211,198,255,.15); }
 .source-controls .source-edit { font-weight: 700; }
 .source-controls .source-edit.insert { border-color: #5b4d86; color: #c9b9f3; }
 .source-controls .source-edit.overwrite { border-color: #7a4a5b; color: #efb4c8; }
@@ -395,6 +403,14 @@ button { color: inherit; }
 .media-thumb img, .media-thumb video { width: 100%; height: 100%; object-fit: cover; opacity: .76; filter: saturate(.8) contrast(1.1); }
 .media-thumb > b { position: absolute; z-index: 3; padding: 3px 5px; border: 1px solid #a53b72; border-radius: 3px; background: rgba(30,7,20,.88); color: #ff85bf; font-size: 6px; letter-spacing: .09em; }
 .media-thumb > span { position: absolute; right: 4px; bottom: 3px; padding: 1px 3px; z-index: 2; border-radius: 2px; background: rgba(0,0,0,.7); color: #ddd; font-size: 7px; font-variant-numeric: tabular-nums; }
+.media-proxy-badge { position: absolute; z-index: 4; left: 4px; top: 4px; width: 16px; height: 16px; border: 1px solid #538b76; border-radius: 4px; display: grid; place-items: center; color: #cffff0; background: rgba(22,57,45,.94); font-size: 8px; font-weight: 800; font-style: normal; box-shadow: 0 2px 7px rgba(0,0,0,.45); }
+.media-proxy-badge.queued, .media-proxy-badge.processing { border-color: #7763ad; color: #e0d4ff; background: rgba(54,40,84,.94); }
+.media-proxy-badge.error { border-color: #a94f61; color: #ffd0d7; background: rgba(86,26,39,.94); }
+.media-analysis-badge { position: absolute; z-index: 4; right: 4px; top: 4px; width: 16px; height: 16px; border: 1px solid #4d6f93; border-radius: 50%; display: grid; place-items: center; color: #d5e9ff; background: rgba(24,46,70,.94); font-size: 8px; font-weight: 800; font-style: normal; box-shadow: 0 2px 7px rgba(0,0,0,.45); }
+.media-analysis-badge.queued, .media-analysis-badge.processing { border-color: #7763ad; color: #e0d4ff; background: rgba(54,40,84,.94); }
+.media-analysis-badge.error { border-color: #a94f61; color: #ffd0d7; background: rgba(86,26,39,.94); }
+.media-preparation-status { height: 24px; padding: 0 7px; margin-right: 3px; border: 1px solid #2d343d; border-radius: 4px; display: inline-flex; align-items: center; gap: 4px; color: #8b95a2; background: #12161b; font-size: 8px; font-weight: 650; white-space: nowrap; }
+.media-preparation-status.working { border-color: #594d78; color: #d8cbfa; background: #211b30; }
 .media-card strong, .media-card small, .media-list-row strong, .media-list-row small { display: block; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 .media-card strong { margin-top: 4px; color: #cacdd5; font-size: 9px; font-weight: 600; }
 .media-card small { margin-top: 1px; color: #5e6470; font-size: 7px; letter-spacing: .05em; }
@@ -593,6 +609,16 @@ button { color: inherit; }
 .transport-controls button:hover { color: white; background: #1b1e24; }
 .transport-controls .play-button { width: 31px; height: 31px; margin: 0 3px; background: #f0f0f3; color: #111217; }
 .transport-controls .play-button:hover { background: white; color: #111217; }
+.transport-controls .shuttle { width: 24px; height: 24px; border-radius: 4px; font-size: 8px; font-weight: 800; }
+.transport-controls .shuttle.active { color: white; background: #493476; box-shadow: inset 0 0 0 1px rgba(211,198,255,.16); }
+.shuttle-rate { min-width: 35px; color: #bdaaff; font-size: 8px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.transport-range-controls { justify-self: end; display: flex; align-items: center; gap: 3px; }
+.transport-range-controls button { height: 23px; min-width: 28px; padding: 0 7px; border: 1px solid #30343d; border-radius: 4px; color: #8d949f; background: #15181d; font-size: 8px; font-weight: 650; cursor: pointer; }
+.transport-range-controls button:nth-child(4) { min-width: 43px; }
+.transport-range-controls button:hover:not(:disabled) { border-color: #62557c; color: #eee8ff; background: #211b2d; }
+.transport-range-controls button.marked { border-color: #567e8a; color: #d8f8ff; background: #183038; }
+.transport-range-controls button:disabled { border-color: #252a31; color: #454b55; background: #111318; cursor: default; }
+.transport-range-controls .timecode { min-width: 68px; margin-left: 5px; }
 .flip { transform: scaleX(-1); }
 
 .inspector-content { height: calc(100% - 33px); overflow-y: auto; }
@@ -730,6 +756,10 @@ button { color: inherit; }
 .timeline-marker { position: absolute; z-index: 6; top: 0; width: 10px; height: 11px; margin-left: -5px; padding: 0; border: 0; background: var(--marker-color); clip-path: polygon(0 0,100% 0,100% 62%,50% 100%,0 62%); cursor: pointer; filter: drop-shadow(0 1px 3px rgba(0,0,0,.5)); }
 .timeline-marker:hover { transform: scale(1.2); }
 .tracks { position: relative; }
+.timeline-range-overlay { position: absolute; z-index: 10; top: 0; bottom: 0; border-left: 2px solid #79d7ec; border-right: 2px solid #79d7ec; background: rgba(91,198,220,.075); box-shadow: inset 8px 0 12px -12px #75d8ed, inset -8px 0 12px -12px #75d8ed; pointer-events: none; }
+.timeline-range-overlay span { position: absolute; top: 2px; padding: 2px 4px; border-radius: 3px; color: #071014; background: #83deef; font-size: 7px; font-weight: 800; line-height: 10px; letter-spacing: .04em; }
+.timeline-range-overlay span:first-child { left: 3px; }
+.timeline-range-overlay span:last-child { right: 3px; }
 .track-lane { position: relative; height: 46px; border-bottom: 1px solid #20232a; background-image: linear-gradient(90deg, rgba(255,255,255,.018) 1px, transparent 1px); background-size: 40px 100%; }
 .track-lane.audio { background-color: rgba(18,33,25,.22); }
 .track-lane.caption { background-color: rgba(15,34,38,.32); }

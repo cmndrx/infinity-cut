@@ -70,7 +70,7 @@ import {maskAtFrame, upsertMaskKeyframe} from "./masks";
 import {sourceTimeForTimelineFrame, trackTemplateTranslation, trackingRegionForMask} from "./tracking";
 import {getAnimatedPropertyValue, hasKeyframeAt, hasPropertyKeyframes} from "./animation";
 import {getClipPlaybackRate, getClipSourceSpan, MAX_PLAYBACK_RATE, MIN_PLAYBACK_RATE, playbackRateForDuration} from "./clip-speed";
-import {cloneClips, moveClips, placeMedia, retimeClip, rippleDelete, splitClip, trimClip, type CommandResult} from "./core";
+import {cloneClips, editTimelineRange, moveClips, placeMedia, retimeClip, rippleDelete, splitClip, trimClip, type CommandResult} from "./core";
 import {conformMediaToFrameRate, formatFrameRate, frameRatesMatch, normalizeFrameRate, retimeProjectForFrameRate} from "./frame-rate";
 import {createProjectFile, normalizeProject, saveStoredProject} from "./project-storage";
 import {canNestSequence, createSequence, switchActiveSequence, syncActiveSequence} from "./sequences";
@@ -81,6 +81,10 @@ import {DEFAULT_CAPTION_STYLE, DEFAULT_COLOR_GRADE, DEFAULT_EFFECTS, DEFAULT_TIT
 import {AudioMixerPanel, observeLiveAudioPreview, VoiceoverRecorder, type VoiceoverRecording, type VoiceoverUpload} from "./audio";
 import {createVisualEffectInstance, getVisualEffectDescriptor, listVisualEffects, type VisualEffectInstance} from "./effects/registry";
 import {importObjectMatteSequence} from "./mattes/object-matte";
+import {resolveMediaPreviewSource, type ProxyApiStatus} from "./proxy";
+import {waveformForClip, type MediaAnalysisApiStatus} from "./media-analysis";
+import {frameRangeIntersects, timelineFrameWindow, visibleRulerSeconds} from "./timeline-virtualization";
+import {projectRenderFingerprint, usableRenderCache} from "./render-cache";
 
 type MediaItem = ProjectMedia;
 type MediaView = "grid" | "list";
@@ -123,6 +127,7 @@ type RenderJobStatus = {
 type PropertyGroup = "transform" | "effects" | "audio";
 type TimelineTool = "select" | "razor" | "ripple" | "roll" | "slip" | "slide";
 type EditMode = "insert" | "overwrite";
+type TimelineRange = {inFrame: number; outFrame: number};
 type DragMode = "move" | "trim-start" | "trim-end" | "ripple-start" | "ripple-end" | "roll-end" | "slip" | "slide" | "fade-in" | "fade-out";
 type DragState = {
   clipId: string;
@@ -308,6 +313,10 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
   const [sourceFrame, setSourceFrame] = useState(0);
   const [sourcePlaying, setSourcePlaying] = useState(false);
   const [sourceRanges, setSourceRanges] = useState<Record<string, {inFrame: number; outFrame: number}>>({});
+  const [useProxies, setUseProxies] = useState(() => window.localStorage.getItem("directors-use-proxies") !== "false");
+  const [useRenderCache, setUseRenderCache] = useState(() => window.localStorage.getItem("directors-use-render-cache") !== "false");
+  const [timelineRange, setTimelineRange] = useState<TimelineRange | null>(null);
+  const [shuttleRate, setShuttleRate] = useState(0);
   const [frame, setFrame] = useState(105);
   const [isPlaying, setIsPlaying] = useState(false);
   const [zoom, setZoom] = useState(1.45);
@@ -333,7 +342,7 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
   const [contextMenu, setContextMenu] = useState<ClipContextMenu | null>(null);
   const [dragTrackTarget, setDragTrackTarget] = useState<string | null>(null);
   const [scrubbing, setScrubbing] = useState(false);
-  const [waveforms, setWaveforms] = useState<Record<string, number[]>>({});
+  const [timelineViewport, setTimelineViewport] = useState({scrollLeft: 0, width: 940});
   const [toast, setToast] = useState("Autosaved just now");
   const [exportOpen, setExportOpen] = useState(false);
   const [reviewOpen, setReviewOpen] = useState(false);
@@ -360,6 +369,10 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
   const [frameRateMismatch, setFrameRateMismatch] = useState<FrameRateMismatch | null>(null);
   const [speedDialog, setSpeedDialog] = useState<SpeedDialogState | null>(null);
   const playerRef = useRef<PlayerRef>(null);
+  const frameRef = useRef(frame);
+  frameRef.current = frame;
+  const sourceFrameRef = useRef(sourceFrame);
+  sourceFrameRef.current = sourceFrame;
   const sourceMediaRef = useRef<HTMLVideoElement | HTMLAudioElement>(null);
   const initialFrameRef = useRef(frame);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -374,7 +387,7 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
   const clipboardRef = useRef<ClipboardPackage>({clips: [], transitions: []});
   const colorClipboardRef = useRef<EditorClip["effects"] | null>(null);
   const marqueeRef = useRef<MarqueeState | null>(null);
-  const waveformRequestsRef = useRef<Set<string>>(new Set());
+  const analysisRequestsRef = useRef<Set<string>>(new Set());
   const frameRateChoiceResolverRef = useRef<((choice: FrameRateChoice) => void) | null>(null);
   const maskDragRef = useRef<{maskId: string; clientX: number; clientY: number; x: number; y: number; width: number; height: number; mode: "move" | "resize"; corner?: "nw" | "ne" | "sw" | "se"} | null>(null);
   const cancelMaskTrackingRef = useRef(false);
@@ -418,6 +431,127 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
   }, [projectId, sharedSession]);
 
   useEffect(() => {
+    window.localStorage.setItem("directors-use-proxies", String(useProxies));
+  }, [useProxies]);
+
+  useEffect(() => {
+    window.localStorage.setItem("directors-use-render-cache", String(useRenderCache));
+  }, [useRenderCache]);
+
+  const proxyPollKey = project.media
+    .filter((item) => item.proxy && (item.proxy.status === "queued" || item.proxy.status === "processing"))
+    .map((item) => `${item.id}:${item.proxy!.id}`)
+    .sort()
+    .join("|");
+  useEffect(() => {
+    if (!proxyPollKey) return;
+    let disposed = false;
+    const poll = async () => {
+      const active = projectRef.current.media.filter((item) => item.proxy && (item.proxy.status === "queued" || item.proxy.status === "processing"));
+      const updates = await Promise.all(active.map(async (item) => {
+        try {
+          const response = await fetch(`/api/proxies/${item.proxy!.id}`);
+          if (response.status === 404) return {mediaId: item.id, proxy: {...item.proxy!, status: "error" as const, error: "Proxy job was interrupted; create it again"}};
+          const proxy = await response.json() as ProxyApiStatus & {error?: string};
+          if (!response.ok) throw new Error(proxy.error ?? "Proxy status failed");
+          return {mediaId: item.id, proxy};
+        } catch (error) {
+          return {mediaId: item.id, proxy: {...item.proxy!, status: "error" as const, error: error instanceof Error ? error.message : "Proxy status failed"}};
+        }
+      }));
+      if (disposed || !updates.length) return;
+      setProject((current) => {
+        let changed = false;
+        const media = current.media.map((item) => {
+          const update = updates.find((candidate) => candidate.mediaId === item.id);
+          if (!update || JSON.stringify(item.proxy) === JSON.stringify(update.proxy)) return item;
+          changed = true;
+          return {...item, proxy: update.proxy};
+        });
+        return changed ? {...current, media} : current;
+      });
+    };
+    void poll();
+    const interval = window.setInterval(() => void poll(), 750);
+    return () => {disposed = true; window.clearInterval(interval);};
+  }, [proxyPollKey]);
+
+  useEffect(() => {
+    for (const media of project.media) {
+      if (media.analysis || media.offline || media.renderReady === false || analysisRequestsRef.current.has(media.id)) continue;
+      analysisRequestsRef.current.add(media.id);
+      void (async () => {
+        try {
+          const response = await fetch("/api/media-analysis", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({src: media.src, kind: media.kind})});
+          const analysis = await response.json() as MediaAnalysisApiStatus & {error?: string};
+          if (!response.ok) throw new Error(analysis.error ?? "Media preparation could not start");
+          setProject((current) => ({...current, media: current.media.map((item) => item.id === media.id ? {...item, analysis} : item)}));
+        } catch (error) {
+          analysisRequestsRef.current.delete(media.id);
+          setToast(error instanceof Error ? error.message : "Media preparation failed");
+        }
+      })();
+    }
+  }, [project.media]);
+
+  const analysisPollKey = project.media
+    .filter((item) => item.analysis && (item.analysis.status === "queued" || item.analysis.status === "processing"))
+    .map((item) => `${item.id}:${item.analysis!.id}`)
+    .sort()
+    .join("|");
+  useEffect(() => {
+    if (!analysisPollKey) return;
+    let disposed = false;
+    const poll = async () => {
+      const active = projectRef.current.media.filter((item) => item.analysis && (item.analysis.status === "queued" || item.analysis.status === "processing"));
+      const updates = await Promise.all(active.map(async (item) => {
+        try {
+          const response = await fetch(`/api/media-analysis/${item.analysis!.id}`);
+          if (response.status === 404) return {mediaId: item.id, analysis: {...item.analysis!, status: "error" as const, error: "Media preparation was interrupted"}};
+          const analysis = await response.json() as MediaAnalysisApiStatus & {error?: string};
+          if (!response.ok) throw new Error(analysis.error ?? "Media preparation status failed");
+          return {mediaId: item.id, analysis};
+        } catch (error) {
+          return {mediaId: item.id, analysis: {...item.analysis!, status: "error" as const, error: error instanceof Error ? error.message : "Media preparation status failed"}};
+        }
+      }));
+      if (disposed || !updates.length) return;
+      setProject((current) => {
+        let changed = false;
+        const media = current.media.map((item) => {
+          const update = updates.find((candidate) => candidate.mediaId === item.id);
+          if (!update || JSON.stringify(item.analysis) === JSON.stringify(update.analysis)) return item;
+          changed = true;
+          return {...item, analysis: update.analysis};
+        });
+        return changed ? {...current, media} : current;
+      });
+    };
+    void poll();
+    const interval = window.setInterval(() => void poll(), 750);
+    return () => {disposed = true; window.clearInterval(interval);};
+  }, [analysisPollKey]);
+
+  const cachePollKey = project.renderCache && (project.renderCache.status === "queued" || project.renderCache.status === "rendering") ? project.renderCache.id : "";
+  useEffect(() => {
+    if (!cachePollKey) return;
+    let disposed = false;
+    const poll = async () => {
+      try {
+        const response = await fetch(`/api/render-cache/${cachePollKey}`);
+        const renderCache = await response.json() as NonNullable<EditorProject["renderCache"]> & {error?: string};
+        if (!response.ok) throw new Error(renderCache.error ?? "Timeline cache status failed");
+        if (!disposed) setProject((current) => current.renderCache?.id === cachePollKey ? {...current, renderCache} : current);
+      } catch (error) {
+        if (!disposed) setProject((current) => current.renderCache?.id === cachePollKey ? {...current, renderCache: {...current.renderCache, status: "error", error: error instanceof Error ? error.message : "Timeline cache status failed"} as NonNullable<EditorProject["renderCache"]>} : current);
+      }
+    };
+    void poll();
+    const interval = window.setInterval(() => void poll(), 1000);
+    return () => {disposed = true; window.clearInterval(interval);};
+  }, [cachePollKey]);
+
+  useEffect(() => {
     setDestinationRoutes((current) => {
       const next = {...current};
       let changed = false;
@@ -437,12 +571,53 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
 
   const pixelsPerFrame = zoom * 1.35;
   const timelineWidth = Math.max(940, project.durationInFrames * pixelsPerFrame + 120);
+  const virtualTimelineWindow = useMemo(() => timelineFrameWindow(timelineViewport, pixelsPerFrame, project.durationInFrames), [pixelsPerFrame, project.durationInFrames, timelineViewport]);
+  const virtualRulerSeconds = useMemo(() => visibleRulerSeconds(virtualTimelineWindow, project.fps, project.durationInFrames), [project.durationInFrames, project.fps, virtualTimelineWindow]);
+  const virtualClipsByTrack = useMemo(() => project.clips.reduce<Record<string, EditorClip[]>>((tracks, clip) => {
+    if (!frameRangeIntersects(clip.start, clip.duration, virtualTimelineWindow)) return tracks;
+    (tracks[clip.trackId] ??= []).push(clip);
+    return tracks;
+  }, {}), [project.clips, virtualTimelineWindow]);
+  const virtualTransitionsByTrack = useMemo(() => {
+    const clipsById = new Map(project.clips.map((clip) => [clip.id, clip]));
+    return project.transitions.reduce<Record<string, EditorTransition[]>>((tracks, transition) => {
+      const from = clipsById.get(transition.fromClipId);
+      const to = clipsById.get(transition.toClipId);
+      if (!from || !to || !isTransitionClip(from) || !isTransitionClip(to) || from.trackId !== to.trackId || from.start + from.duration !== to.start) return tracks;
+      if (!frameRangeIntersects(to.start - transition.duration / 2, transition.duration, virtualTimelineWindow)) return tracks;
+      (tracks[from.trackId] ??= []).push(transition);
+      return tracks;
+    }, {});
+  }, [project.clips, project.transitions, virtualTimelineWindow]);
+  const waveforms = useMemo(() => Object.fromEntries(project.clips.filter((clip) => clip.kind === "audio").map((clip) => {
+    const media = project.media.find((item) => item.id === clip.sourceMediaId);
+    return [clip.id, waveformForClip(clip, media, project.fps)];
+  })), [project.clips, project.fps, project.media]);
   const selectedClipId = selectedClipIds[selectedClipIds.length - 1] ?? null;
   const selectedClip = project.clips.find((clip) => clip.id === selectedClipId) ?? null;
   const selectedTransition = project.transitions.find((transition) => transition.id === selectedTransitionId) ?? null;
-  const playerInputProps = useMemo(() => ({project}), [project]);
+  const playerInputProps = useMemo(() => ({project, useProxies, useRenderCache}), [project, useProxies, useRenderCache]);
   const binPointerDragId = binPointerDrag?.item.id;
   const marqueeActive = marquee !== null;
+
+  useEffect(() => {
+    const scroller = timelineScrollerRef.current;
+    if (!scroller) return;
+    let animationFrame = 0;
+    const measure = () => {
+      window.cancelAnimationFrame(animationFrame);
+      animationFrame = window.requestAnimationFrame(() => setTimelineViewport({scrollLeft: scroller.scrollLeft, width: scroller.clientWidth}));
+    };
+    measure();
+    scroller.addEventListener("scroll", measure, {passive: true});
+    const observer = new ResizeObserver(measure);
+    observer.observe(scroller);
+    return () => {
+      window.cancelAnimationFrame(animationFrame);
+      scroller.removeEventListener("scroll", measure);
+      observer.disconnect();
+    };
+  }, []);
 
   const commit = useCallback((updater: (draft: EditorProject) => void, message?: string) => {
     setProject((current) => {
@@ -586,7 +761,19 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
   }, [project.durationInFrames]);
 
   const togglePlayback = useCallback(() => {
+    if (shuttleRate !== 0) {
+      setShuttleRate(0);
+      return;
+    }
     playerRef.current?.toggle();
+  }, [shuttleRate]);
+
+  const changeShuttleRate = useCallback((direction: -1 | 0 | 1) => {
+    setShuttleRate((current) => {
+      if (direction === 0) return 0;
+      if (Math.sign(current) !== direction) return direction;
+      return direction * Math.min(4, Math.max(1, Math.abs(current) * 2));
+    });
   }, []);
 
   const scrubToClientX = useCallback((clientX: number) => {
@@ -940,41 +1127,6 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
   }, [isPlaying, project]);
 
   useEffect(() => {
-    for (const clip of project.clips.filter((item) => item.kind === "audio" && item.src)) {
-      const playbackRate = getClipPlaybackRate(clip);
-      const requestKey = `${clip.id}:${clip.src}:${clip.sourceStart}:${clip.duration}:${playbackRate}`;
-      if (waveformRequestsRef.current.has(requestKey)) continue;
-      waveformRequestsRef.current.add(requestKey);
-      void (async () => {
-        const AudioContextClass = window.AudioContext;
-        const context = new AudioContextClass();
-        try {
-          const response = await fetch(clip.src!);
-          const buffer = await response.arrayBuffer();
-          const decoded = await context.decodeAudioData(buffer);
-          const channel = decoded.getChannelData(0);
-          const startSample = Math.floor((clip.sourceStart / project.fps) * decoded.sampleRate);
-          const endSample = Math.min(channel.length, startSample + Math.floor(((clip.duration * playbackRate) / project.fps) * decoded.sampleRate));
-          const peakCount = 96;
-          const blockSize = Math.max(1, Math.floor((endSample - startSample) / peakCount));
-          const peaks = Array.from({length: peakCount}, (_, index) => {
-            const from = startSample + index * blockSize;
-            const to = Math.min(endSample, from + blockSize);
-            let peak = 0;
-            for (let sample = from; sample < to; sample += Math.max(1, Math.floor(blockSize / 64))) peak = Math.max(peak, Math.abs(channel[sample] ?? 0));
-            return Math.max(0.04, peak);
-          });
-          setWaveforms((current) => ({...current, [clip.id]: peaks}));
-        } catch {
-          // Unsupported or temporarily unavailable media keeps the lightweight fallback waveform.
-        } finally {
-          void context.close();
-        }
-      })();
-    }
-  }, [project.clips, project.fps]);
-
-  useEffect(() => {
     const keydown = (event: KeyboardEvent) => {
       const target = event.target as HTMLElement;
       if (["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName)) return;
@@ -997,8 +1149,18 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
       } else if (event.key === " " || event.code === "Space") {
         event.preventDefault();
         if (monitorMode === "source" && sourceMediaRef.current) {
+          setShuttleRate(0);
           if (sourceMediaRef.current.paused) void sourceMediaRef.current.play(); else sourceMediaRef.current.pause();
         } else togglePlayback();
+      } else if (event.key.toLowerCase() === "j") {
+        event.preventDefault();
+        changeShuttleRate(-1);
+      } else if (event.key.toLowerCase() === "k") {
+        event.preventDefault();
+        changeShuttleRate(0);
+      } else if (event.key.toLowerCase() === "l") {
+        event.preventDefault();
+        changeShuttleRate(1);
       } else if (event.key.toLowerCase() === "s") {
         event.preventDefault();
         splitSelected();
@@ -1033,7 +1195,7 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
     };
     window.addEventListener("keydown", keydown);
     return () => window.removeEventListener("keydown", keydown);
-  }, [addMarker, copySelected, deleteSelected, deleteSelectedTransition, duplicateSelected, frame, monitorMode, openSpeedDialog, pasteClips, project.fps, redo, rippleDeleteSelected, seek, selectedTransitionId, splitSelected, togglePlayback, undo]);
+  }, [addMarker, changeShuttleRate, copySelected, deleteSelected, deleteSelectedTransition, duplicateSelected, frame, monitorMode, openSpeedDialog, pasteClips, project.fps, redo, rippleDeleteSelected, seek, selectedTransitionId, splitSelected, togglePlayback, undo]);
 
   useEffect(() => {
     const isFileDrag = (event: DragEvent) => Array.from(event.dataTransfer?.types ?? []).includes("Files");
@@ -1333,6 +1495,13 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
     return counts;
   }, {}), [project.clips]);
   const selectedMedia = project.media.find((item) => item.id === selectedMediaId) ?? null;
+  const readyProxyCount = project.media.filter((item) => item.proxy?.status === "ready").length;
+  const workingProxyCount = project.media.filter((item) => item.proxy?.status === "queued" || item.proxy?.status === "processing").length;
+  const preparedMediaCount = project.media.filter((item) => item.analysis?.status === "ready").length;
+  const preparingMediaCount = project.media.filter((item) => item.analysis?.status === "queued" || item.analysis?.status === "processing").length;
+  const renderCacheUsable = usableRenderCache(project);
+  const renderCacheWorking = project.renderCache?.status === "queued" || project.renderCache?.status === "rendering";
+  const selectedMediaPreviewSrc = selectedMedia ? resolveMediaPreviewSource(selectedMedia, useProxies) : undefined;
   const activeSequence = project.sequences.find((sequence) => sequence.id === project.activeSequenceId);
   const sourceRange = useMemo(() => selectedMedia ? (sourceRanges[selectedMedia.id] ?? {inFrame: 0, outFrame: selectedMedia.duration}) : null, [selectedMedia, sourceRanges]);
   const openInSourceMonitor = useCallback((item: ProjectMedia) => {
@@ -1347,6 +1516,55 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
     setSourceFrame(bounded);
     if (sourceMediaRef.current) sourceMediaRef.current.currentTime = bounded / project.fps;
   }, [project.fps, selectedMedia]);
+  useEffect(() => {
+    const source = sourceMediaRef.current;
+    if (shuttleRate === 0) {
+      if (monitorMode === "source") source?.pause();
+      else playerRef.current?.pause();
+      return;
+    }
+    if (shuttleRate > 0) {
+      if (monitorMode === "source") {
+        if (!source || selectedMedia?.kind === "image") return;
+        source.playbackRate = shuttleRate;
+        void source.play().catch(() => setShuttleRate(0));
+        return () => source.pause();
+      }
+      const player = playerRef.current;
+      player?.play();
+      return () => player?.pause();
+    }
+    if (monitorMode === "source") source?.pause(); else playerRef.current?.pause();
+    let animationFrame = 0;
+    let previousTime = performance.now();
+    let accumulator = 0;
+    const reverse = (time: number) => {
+      accumulator += ((time - previousTime) / 1000) * project.fps * Math.abs(shuttleRate);
+      previousTime = time;
+      const wholeFrames = Math.floor(accumulator);
+      if (wholeFrames > 0) {
+        accumulator -= wholeFrames;
+        if (monitorMode === "source") {
+          const next = Math.max(sourceRange?.inFrame ?? 0, sourceFrameRef.current - wholeFrames);
+          seekSource(next);
+          if (next <= (sourceRange?.inFrame ?? 0)) {setShuttleRate(0); return;}
+        } else {
+          const next = Math.max(timelineRange?.inFrame ?? 0, frameRef.current - wholeFrames);
+          seek(next);
+          if (next <= (timelineRange?.inFrame ?? 0)) {setShuttleRate(0); return;}
+        }
+      }
+      animationFrame = requestAnimationFrame(reverse);
+    };
+    animationFrame = requestAnimationFrame(reverse);
+    return () => cancelAnimationFrame(animationFrame);
+  }, [monitorMode, project.fps, seek, seekSource, selectedMedia?.kind, shuttleRate, sourceRange?.inFrame, timelineRange?.inFrame]);
+  useEffect(() => {
+    if (monitorMode === "program" && shuttleRate > 0 && timelineRange && frame >= timelineRange.outFrame) {
+      setShuttleRate(0);
+      seek(timelineRange.outFrame - 1);
+    }
+  }, [frame, monitorMode, seek, shuttleRate, timelineRange]);
   const setSourcePoint = useCallback((edge: "inFrame" | "outFrame") => {
     if (!selectedMedia) return;
     setSourceRanges((current) => {
@@ -1383,6 +1601,51 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
       setMonitorMode("program");
     }
   }, [applyKernelResult, destinationRoutes, frame, project, selectedMedia, sourceRange, targetedTrackIds]);
+  const setTimelinePoint = useCallback((edge: "inFrame" | "outFrame") => {
+    setTimelineRange((current) => edge === "inFrame"
+      ? {inFrame: Math.min(frame, (current?.outFrame ?? project.durationInFrames) - 1), outFrame: current?.outFrame ?? project.durationInFrames}
+      : {inFrame: current?.inFrame ?? 0, outFrame: Math.max(frame + 1, (current?.inFrame ?? 0) + 1)});
+    setToast(`Marked timeline ${edge === "inFrame" ? "In" : "Out"}`);
+  }, [frame, project.durationInFrames]);
+  const performRangeEdit = useCallback((mode: "lift" | "extract") => {
+    if (!timelineRange) {
+      setToast("Mark timeline In and Out before using Lift or Extract");
+      return;
+    }
+    const result = editTimelineRange(project, {
+      mode,
+      inFrame: timelineRange.inFrame,
+      outFrame: timelineRange.outFrame,
+      trackIds: targetedTrackIds,
+      includeLinked: linkedSelection,
+      idBase: `${mode}-${Date.now()}`,
+    });
+    if (applyKernelResult(result, `${mode === "lift" ? "Lifted" : "Extracted"} ${formatTimecode(timelineRange.outFrame - timelineRange.inFrame, project.fps)} from targeted tracks`) && result.ok) {
+      setSelectedClipIds([]);
+      seek(timelineRange.inFrame);
+      setTimelineRange(null);
+    }
+  }, [applyKernelResult, linkedSelection, project, seek, targetedTrackIds, timelineRange]);
+  useEffect(() => {
+    const onProgramRangeShortcut = (event: KeyboardEvent) => {
+      if (monitorMode !== "program" || ["INPUT", "TEXTAREA", "SELECT"].includes((event.target as HTMLElement).tagName)) return;
+      if (event.key.toLowerCase() === "i") {
+        event.preventDefault();
+        setTimelinePoint("inFrame");
+      } else if (event.key.toLowerCase() === "o") {
+        event.preventDefault();
+        setTimelinePoint("outFrame");
+      } else if (event.key === ";") {
+        event.preventDefault();
+        performRangeEdit("lift");
+      } else if (event.key === "'") {
+        event.preventDefault();
+        performRangeEdit("extract");
+      }
+    };
+    window.addEventListener("keydown", onProgramRangeShortcut);
+    return () => window.removeEventListener("keydown", onProgramRangeShortcut);
+  }, [monitorMode, performRangeEdit, setTimelinePoint]);
   const changeSequence = useCallback((sequenceId: string) => {
     try {
       const next = switchActiveSequence(project, sequenceId);
@@ -1392,6 +1655,7 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
       setSelectedClipIds([]);
       setSelectedTransitionId(null);
       setFrame(0);
+      setTimelineRange(null);
       setToast(`Opened ${next.sequences.find((sequence) => sequence.id === sequenceId)?.name ?? "sequence"}`);
     } catch (error) {
       setToast(error instanceof Error ? error.message : "Sequence could not be opened");
@@ -1405,6 +1669,7 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
     setProject(switchActiveSequence(withSequence, nextSequence.id));
     setSelectedClipIds([]);
     setFrame(0);
+    setTimelineRange(null);
     setToast(`Created ${nextSequence.name}`);
   }, [project]);
   const duplicateSequence = useCallback(() => {
@@ -1420,6 +1685,7 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
     setProject(next);
     setSelectedClipIds([]);
     setFrame(0);
+    setTimelineRange(null);
     setToast(`Duplicated ${source.name}`);
   }, [project]);
   const nestSequence = useCallback((sequenceId: string) => {
@@ -2294,6 +2560,76 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
     if (media) media.binId = binId;
   }, `Moved media to ${project.mediaBins.find((bin) => bin.id === binId)?.name ?? "bin"}`);
 
+  const createMediaProxy = async (mediaId: string) => {
+    const media = projectRef.current.media.find((item) => item.id === mediaId);
+    if (!media || media.kind !== "video") return setToast("Only video media needs a proxy");
+    if (media.offline || media.renderReady === false) return setToast("Relink this media before creating a proxy");
+    try {
+      if (media.proxy?.status === "error") await fetch(`/api/proxies/${media.proxy.id}`, {method: "DELETE"});
+      const response = await fetch("/api/proxies", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({src: media.src})});
+      const proxy = await response.json() as ProxyApiStatus & {error?: string};
+      if (!response.ok) throw new Error(proxy.error ?? "Proxy generation could not start");
+      setProject((current) => ({...current, media: current.media.map((item) => item.id === mediaId ? {...item, proxy} : item)}));
+      setToast(proxy.status === "ready" ? `${media.name} proxy is ready` : `Creating ${media.name} proxy in the background`);
+    } catch (error) {
+      setToast(error instanceof Error ? error.message : "Proxy generation failed");
+    }
+  };
+
+  const prepareMediaForEditing = async (mediaId: string) => {
+    const media = projectRef.current.media.find((item) => item.id === mediaId);
+    if (!media || media.offline || media.renderReady === false) return setToast("Relink this media before preparing it");
+    try {
+      if (media.analysis?.status === "error") await fetch(`/api/media-analysis/${media.analysis.id}`, {method: "DELETE"});
+      const response = await fetch("/api/media-analysis", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({src: media.src, kind: media.kind})});
+      const analysis = await response.json() as MediaAnalysisApiStatus & {error?: string};
+      if (!response.ok) throw new Error(analysis.error ?? "Media preparation could not start");
+      analysisRequestsRef.current.add(media.id);
+      setProject((current) => ({...current, media: current.media.map((item) => item.id === mediaId ? {...item, analysis} : item)}));
+      if (media.kind === "video" && media.proxy?.status !== "ready" && media.proxy?.status !== "queued" && media.proxy?.status !== "processing") void createMediaProxy(mediaId);
+      setToast(analysis.status === "ready" ? `${media.name} is optimized for editing` : `Preparing ${media.name} in the background`);
+    } catch (error) {
+      setToast(error instanceof Error ? error.message : "Media preparation failed");
+    }
+  };
+
+  const removeMediaProxy = async (mediaId: string) => {
+    const media = projectRef.current.media.find((item) => item.id === mediaId);
+    if (!media?.proxy) return;
+    try {
+      const response = await fetch(`/api/proxies/${media.proxy.id}`, {method: "DELETE"});
+      if (!response.ok && response.status !== 404) throw new Error("Proxy cache could not be removed");
+      setProject((current) => ({...current, media: current.media.map((item) => item.id === mediaId ? {...item, proxy: undefined} : item)}));
+      setToast(`Removed ${media.name} proxy · original media is unchanged`);
+    } catch (error) {
+      setToast(error instanceof Error ? error.message : "Proxy removal failed");
+    }
+  };
+
+  const createTimelineRenderCache = async () => {
+    const current = projectRef.current;
+    try {
+      if (current.renderCache && (current.renderCache.status === "error" || current.renderCache.fingerprint !== projectRenderFingerprint(current))) await fetch(`/api/render-cache/${current.renderCache.id}`, {method: "DELETE"});
+      const response = await fetch("/api/render-cache", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({project: {...current, renderCache: undefined}})});
+      const renderCache = await response.json() as NonNullable<EditorProject["renderCache"]> & {error?: string};
+      if (!response.ok) throw new Error(renderCache.error ?? "Timeline cache could not start");
+      setProject((value) => ({...value, renderCache}));
+      setUseRenderCache(true);
+      setToast(renderCache.status === "ready" ? "Timeline render cache is ready" : "Rendering the timeline cache in the background");
+    } catch (error) {
+      setToast(error instanceof Error ? error.message : "Timeline cache failed");
+    }
+  };
+
+  const removeTimelineRenderCache = async () => {
+    const renderCache = projectRef.current.renderCache;
+    if (!renderCache) return;
+    const response = await fetch(`/api/render-cache/${renderCache.id}`, {method: "DELETE"});
+    if (!response.ok && response.status !== 404) return setToast("Timeline cache could not be removed");
+    setProject((current) => ({...current, renderCache: undefined}));
+    setToast("Timeline render cache removed");
+  };
+
   const toggleMediaOffline = (mediaId: string) => {
     const media = project.media.find((item) => item.id === mediaId);
     if (!media) return;
@@ -2334,11 +2670,12 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
       return;
     }
     const replacement = await fileToMediaItem(file, 0, current.binId);
+    analysisRequestsRef.current.delete(pending.id);
     commit((draft) => {
       const item = draft.media.find((candidate) => candidate.id === pending.id);
       if (!item) return;
       const nextName = pending.action === "replace" ? replacement.name : item.name;
-      Object.assign(item, replacement, {id: pending.id, name: nextName, binId: current.binId, color: current.color, offline: false});
+      Object.assign(item, replacement, {id: pending.id, name: nextName, binId: current.binId, color: current.color, offline: false, proxy: undefined, analysis: undefined});
       for (const clip of draft.clips) {
         if (clip.sourceMediaId !== pending.id) continue;
         clip.src = replacement.src;
@@ -2660,8 +2997,10 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
                     title="Drag to a timeline track or double-click to open in Source Monitor"
                   >
                     <div className="media-thumb" style={{"--media-color": item.color} as React.CSSProperties}>
-                      {item.kind === "image" && !item.offline ? <img src={item.src} alt="" /> : clipIcon(item.kind, mediaView === "grid" ? 25 : 15)}
+                      {item.analysis?.status === "ready" && item.analysis.thumbnailUrl && !item.offline ? <img src={item.analysis.thumbnailUrl} alt="" /> : item.kind === "image" && !item.offline ? <img src={item.src} alt="" /> : clipIcon(item.kind, mediaView === "grid" ? 25 : 15)}
                       {item.offline && <b>OFFLINE</b>}
+                      {item.proxy && <i className={`media-proxy-badge ${item.proxy.status}`}>{item.proxy.status === "ready" ? "P" : item.proxy.status === "error" ? "!" : "…"}</i>}
+                      {item.analysis && <i className={`media-analysis-badge ${item.analysis.status}`}>{item.analysis.status === "ready" ? "✓" : item.analysis.status === "error" ? "!" : "…"}</i>}
                       <span>{formatTimecode(item.duration, project.fps).slice(3)}</span>
                     </div>
                     <div className="media-item-copy"><strong>{item.name}</strong><small>{item.kind.toUpperCase()}{mediaUseCounts[item.id] ? ` · ${mediaUseCounts[item.id]} USE${mediaUseCounts[item.id] === 1 ? "" : "S"}` : ""}</small></div>
@@ -2686,6 +3025,8 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
                     <span>Frame <b>{selectedMedia.width && selectedMedia.height ? `${selectedMedia.width} × ${selectedMedia.height}` : "—"}</b></span>
                     <span>Frame rate <b>{selectedMedia.fps ? `${formatFrameRate(selectedMedia.fps)} fps` : "—"}</b></span>
                     <span>Size <b>{selectedMedia.fileSize ? formatBytes(selectedMedia.fileSize) : "Bundled"}</b></span>
+                    <span>Prepared <b>{selectedMedia.analysis?.status === "ready" ? "Ready" : selectedMedia.analysis?.status === "processing" ? "Analyzing" : selectedMedia.analysis?.status === "queued" ? "Queued" : selectedMedia.analysis?.status === "error" ? "Error" : "Pending"}</b></span>
+                    {selectedMedia.kind === "video" && <span>Proxy <b>{selectedMedia.proxy?.status === "ready" ? selectedMedia.proxy.fileSize ? formatBytes(selectedMedia.proxy.fileSize) : "Ready" : selectedMedia.proxy?.status === "processing" ? "Processing" : selectedMedia.proxy?.status === "queued" ? "Queued" : selectedMedia.proxy?.status === "error" ? "Error" : "Not created"}</b></span>}
                   </div>
                   <label className="media-bin-select"><span>Bin</span><select value={selectedMedia.binId} onChange={(event) => moveMediaToBin(selectedMedia.id, event.target.value)}>{project.mediaBins.map((bin) => <option key={bin.id} value={bin.id}>{bin.name}</option>)}</select></label>
                   <div className="media-detail-actions">
@@ -2693,6 +3034,10 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
                     <button onClick={() => startMediaFileAction(selectedMedia.id, "relink")}><RefreshCw size={12} /> Relink</button>
                     <button onClick={() => startMediaFileAction(selectedMedia.id, "replace")}><HardDrive size={12} /> Replace</button>
                     <button onClick={() => toggleMediaOffline(selectedMedia.id)}>{selectedMedia.offline ? <Link2 size={12} /> : <EyeOff size={12} />} {selectedMedia.offline ? "Online" : "Offline"}</button>
+                    <button disabled={selectedMedia.analysis?.status === "queued" || selectedMedia.analysis?.status === "processing"} onClick={() => void prepareMediaForEditing(selectedMedia.id)} title="Cache the thumbnail and waveform; video also gets an edit proxy"><Sparkles size={12} /> {selectedMedia.analysis?.status === "ready" && (selectedMedia.kind !== "video" || selectedMedia.proxy?.status === "ready") ? "Optimized" : selectedMedia.analysis?.status === "error" ? "Retry prep" : "Optimize"}</button>
+                    {selectedMedia.kind === "video" && (selectedMedia.proxy?.status === "ready"
+                      ? <button onClick={() => void removeMediaProxy(selectedMedia.id)} title="Delete cached proxy; original media remains untouched"><Trash2 size={12} /> Proxy</button>
+                      : <button disabled={selectedMedia.proxy?.status === "queued" || selectedMedia.proxy?.status === "processing"} onClick={() => void createMediaProxy(selectedMedia.id)} title={selectedMedia.proxy?.error ?? "Create a lightweight edit proxy in the background"}>{selectedMedia.proxy?.status === "queued" || selectedMedia.proxy?.status === "processing" ? <LoaderCircle className="spinning" size={12} /> : <Gauge size={12} />} {selectedMedia.proxy?.status === "error" ? "Retry" : selectedMedia.proxy ? "Creating" : "Proxy"}</button>)}
                     <button className="danger" disabled={Boolean(mediaUseCounts[selectedMedia.id])} onClick={() => removeMedia(selectedMedia.id)} title={mediaUseCounts[selectedMedia.id] ? "Media in use cannot be removed" : "Remove from project"}><Trash2 size={12} /> Remove</button>
                   </div>
                 </section>
@@ -2844,33 +3189,46 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
               <button className={monitorMode === "source" ? "active" : ""} disabled={!selectedMedia} onClick={() => selectedMedia && setMonitorMode("source")}>Source{selectedMedia ? `: ${selectedMedia.name}` : ""}</button>
               <button className={monitorMode === "program" ? "active" : ""} onClick={() => setMonitorMode("program")}>Program: {activeSequence?.name ?? "Sequence"}</button>
             </div>
-            <div><button>Fit <ChevronDown size={12} /></button><button><Settings2 size={14} /></button></div>
+            <div><button
+              className={`cache-preview-toggle ${renderCacheUsable && useRenderCache ? "active" : ""} ${renderCacheWorking ? "working" : ""}`}
+              disabled={renderCacheWorking}
+              onClick={(event) => {
+                if (event.shiftKey && project.renderCache) void removeTimelineRenderCache();
+                else if (renderCacheUsable) setUseRenderCache((current) => !current);
+                else void createTimelineRenderCache();
+              }}
+              title={renderCacheWorking ? "Rendering timeline cache" : renderCacheUsable ? `${useRenderCache ? "Bypass" : "Use"} cached timeline preview · Shift-click to remove` : "Render a preview cache for the active sequence"}
+            >{renderCacheWorking ? <LoaderCircle className="spinning" size={12} /> : <Sparkles size={12} />} {renderCacheWorking ? "Rendering" : renderCacheUsable ? useRenderCache ? "Cached" : "Cache off" : project.renderCache ? "Rebuild cache" : "Render cache"}</button><button
+              className={`proxy-preview-toggle ${useProxies ? "active" : ""}`}
+              onClick={() => setUseProxies((current) => !current)}
+              title={`${useProxies ? "Disable" : "Enable"} proxy media for Source and Program preview · exports always use originals`}
+            ><Gauge size={13} /> {useProxies ? "Proxy" : "Original"}{workingProxyCount ? <i>{workingProxyCount}</i> : readyProxyCount ? <i>{readyProxyCount}</i> : null}</button><span className={`media-preparation-status ${preparingMediaCount ? "working" : ""}`} title={`${preparedMediaCount} of ${project.media.length} media items have cached thumbnails and waveforms`}>{preparingMediaCount ? <LoaderCircle className="spinning" size={11} /> : <Check size={11} />} {preparingMediaCount ? `Preparing ${preparingMediaCount}` : `${preparedMediaCount} prepared`}</span><button>Fit <ChevronDown size={12} /></button><button><Settings2 size={14} /></button></div>
           </div>
           <div className="program-stage">
             {monitorMode === "source" && selectedMedia ? <div className="source-monitor-frame">
               {selectedMedia.kind === "video" ? <video
-                key={selectedMedia.id}
+                key={`${selectedMedia.id}-${selectedMediaPreviewSrc}`}
                 ref={(node) => {sourceMediaRef.current = node;}}
-                src={selectedMedia.src}
+                src={selectedMediaPreviewSrc}
                 onPlay={() => setSourcePlaying(true)}
                 onPause={() => setSourcePlaying(false)}
                 onTimeUpdate={(event) => {
                   const next = Math.round(event.currentTarget.currentTime * project.fps);
                   setSourceFrame(next);
-                  if (sourceRange && next >= sourceRange.outFrame) {event.currentTarget.pause(); seekSource(sourceRange.inFrame);}
+                  if (sourceRange && next >= sourceRange.outFrame) {event.currentTarget.pause(); setShuttleRate(0); seekSource(sourceRange.inFrame);}
                 }}
               /> : selectedMedia.kind === "audio" ? <div className="source-audio-preview"><AudioWaveform size={46} /><strong>{selectedMedia.name}</strong><small>Audio source</small><audio
-                key={selectedMedia.id}
+                key={`${selectedMedia.id}-${selectedMediaPreviewSrc}`}
                 ref={(node) => {sourceMediaRef.current = node;}}
-                src={selectedMedia.src}
+                src={selectedMediaPreviewSrc}
                 onPlay={() => setSourcePlaying(true)}
                 onPause={() => setSourcePlaying(false)}
                 onTimeUpdate={(event) => {
                   const next = Math.round(event.currentTarget.currentTime * project.fps);
                   setSourceFrame(next);
-                  if (sourceRange && next >= sourceRange.outFrame) {event.currentTarget.pause(); seekSource(sourceRange.inFrame);}
+                  if (sourceRange && next >= sourceRange.outFrame) {event.currentTarget.pause(); setShuttleRate(0); seekSource(sourceRange.inFrame);}
                 }}
-              /></div> : <img src={selectedMedia.src} alt={selectedMedia.name} />}
+              /></div> : <img src={selectedMediaPreviewSrc} alt={selectedMedia.name} />}
             </div> : <div className="player-frame">
               <Player
                 ref={playerRef}
@@ -2882,6 +3240,7 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
                 compositionHeight={project.height}
                 controls={false}
                 autoPlay={false}
+                playbackRate={shuttleRate > 0 ? shuttleRate : 1}
                 initialFrame={initialFrameRef.current}
                 loop
                 acknowledgeRemotionLicense
@@ -2936,7 +3295,10 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
               <span className="timecode primary">{formatTimecode(sourceFrame, project.fps)}</span>
               <button onClick={() => setSourcePoint("inFrame")} title="Mark In (I)">Mark In <kbd>I</kbd></button>
               <button onClick={() => seekSource(sourceFrame - 1)}><ChevronRight className="flip" size={15} /></button>
+              <button className={shuttleRate < 0 ? "shuttle active" : "shuttle"} onClick={() => changeShuttleRate(-1)} title="Play backward (J)">J</button>
               <button className="play-button" onClick={() => {if (selectedMedia.kind === "image") return; if (sourceMediaRef.current?.paused) void sourceMediaRef.current.play(); else sourceMediaRef.current?.pause();}}>{sourcePlaying ? <Pause size={16} fill="currentColor" /> : <Play size={16} fill="currentColor" />}</button>
+              <button className={shuttleRate === 0 ? "shuttle stop" : "shuttle"} onClick={() => changeShuttleRate(0)} title="Stop shuttle (K)">K</button>
+              <button className={shuttleRate > 0 ? "shuttle active" : "shuttle"} onClick={() => changeShuttleRate(1)} title="Play forward (L)">L</button>
               <button onClick={() => seekSource(sourceFrame + 1)}><ChevronRight size={15} /></button>
               <button onClick={() => setSourcePoint("outFrame")} title="Mark Out (O)">Mark Out <kbd>O</kbd></button>
               <button className="source-edit insert" onClick={() => performThreePointEdit("insert")} title="Insert edit (,)">Insert <kbd>,</kbd></button>
@@ -2948,11 +3310,22 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
             <div className="transport-controls">
               <button onClick={() => seek(frame - project.fps)} title="Previous second"><StepBack size={16} /></button>
               <button onClick={() => seek(frame - 1)} title="Previous frame"><ChevronRight className="flip" size={17} /></button>
+              <button className={shuttleRate < 0 ? "shuttle active" : "shuttle"} onClick={() => changeShuttleRate(-1)} title="Play backward (J)">J</button>
               <button className="play-button" onClick={togglePlayback} aria-label={isPlaying ? "Pause" : "Play"} title="Play or pause (Space)">{isPlaying ? <Pause size={17} fill="currentColor" /> : <Play size={17} fill="currentColor" />}</button>
+              <button className={shuttleRate === 0 ? "shuttle stop" : "shuttle"} onClick={() => changeShuttleRate(0)} title="Stop shuttle (K)">K</button>
+              <button className={shuttleRate > 0 ? "shuttle active" : "shuttle"} onClick={() => changeShuttleRate(1)} title="Play forward (L)">L</button>
               <button onClick={() => seek(frame + 1)} title="Next frame"><ChevronRight size={17} /></button>
               <button onClick={() => seek(frame + project.fps)} title="Next second"><StepForward size={16} /></button>
+              {shuttleRate !== 0 && <span className="shuttle-rate">{shuttleRate > 0 ? "▶" : "◀"} {Math.abs(shuttleRate)}×</span>}
             </div>
-            <div className="timecode">{formatTimecode(project.durationInFrames, project.fps)}</div>
+            <div className="transport-range-controls" role="group" aria-label="Timeline range editing">
+              <button className={timelineRange ? "marked" : ""} onClick={() => setTimelinePoint("inFrame")} title="Mark timeline In (I)">In</button>
+              <button className={timelineRange ? "marked" : ""} onClick={() => setTimelinePoint("outFrame")} title="Mark timeline Out (O)">Out</button>
+              <button disabled={!timelineRange} onClick={() => performRangeEdit("lift")} title="Lift marked range and leave a gap (;)">Lift</button>
+              <button disabled={!timelineRange} onClick={() => performRangeEdit("extract")} title="Extract marked range and close the gap (')">Extract</button>
+              <button disabled={!timelineRange} onClick={() => setTimelineRange(null)} title="Clear timeline In and Out">×</button>
+              <span className="timecode">{formatTimecode(project.durationInFrames, project.fps)}</span>
+            </div>
           </div>}
         </section>
 
@@ -3097,10 +3470,10 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
             <div className="timeline-scroll" ref={timelineScrollerRef}>
               <div className="timeline-canvas" style={{width: timelineWidth}}>
                 <div className="ruler" onPointerDown={beginPlayheadScrub}>
-                  {Array.from({length: Math.ceil(project.durationInFrames / project.fps) + 1}, (_, index) => (
-                    <div className="ruler-mark" key={index} style={{left: index * project.fps * pixelsPerFrame}}><i /><span>{formatTimecode(index * project.fps, project.fps).slice(3, 8)}</span></div>
+                  {virtualRulerSeconds.map((second) => (
+                    <div className="ruler-mark" key={second} style={{left: second * project.fps * pixelsPerFrame}}><i /><span>{formatTimecode(second * project.fps, project.fps).slice(3, 8)}</span></div>
                   ))}
-                  {project.markers.map((marker) => (
+                  {project.markers.filter((marker) => frameRangeIntersects(marker.frame, 1, virtualTimelineWindow)).map((marker) => (
                     <button
                       className="timeline-marker"
                       key={marker.id}
@@ -3133,7 +3506,7 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
                           {dropTarget.allowed ? <><Plus size={12} /><span>{editMode === "insert" ? "INSERT" : "OVERWRITE"} · {track.name}</span></> : <><Lock size={12} /><span>{track.name} unavailable</span></>}
                         </div>
                       )}
-                      {project.clips.filter((clip) => clip.trackId === track.id).map((clip) => (
+                      {(virtualClipsByTrack[track.id] ?? []).map((clip) => (
                         <div
                           key={clip.id}
                           data-clip-id={clip.id}
@@ -3158,7 +3531,7 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
                           {clip.linkedGroupId && <Link2 className="linked-badge" size={10} />}
                           {Math.abs(getClipPlaybackRate(clip) - 1) > 0.001 && <span className="clip-speed-badge">{Math.round(getClipPlaybackRate(clip) * 100)}%</span>}
                           {clip.kind === "audio" && <>
-                            <span className="waveform waveform-bars">{(waveforms[clip.id] ?? [0.2, 0.48, 0.82, 0.34, 0.68, 0.92, 0.44, 0.3, 0.78, 0.62, 0.24, 0.5, 0.88, 0.58, 0.32, 0.74]).map((peak, index) => <i key={index} style={{height: `${Math.max(10, peak * 100)}%`}} />)}</span>
+                            <span className="waveform waveform-bars">{(waveforms[clip.id]?.length ? waveforms[clip.id] : [0.2, 0.48, 0.82, 0.34, 0.68, 0.92, 0.44, 0.3, 0.78, 0.62, 0.24, 0.5, 0.88, 0.58, 0.32, 0.74]).map((peak, index) => <i key={index} style={{height: `${Math.max(10, peak * 100)}%`}} />)}</span>
                             {clip.fadeIn > 0 && <span className="audio-fade-region in" style={{width: `${(clip.fadeIn / Math.max(1, clip.duration)) * 100}%`}} />}
                             {clip.fadeOut > 0 && <span className="audio-fade-region out" style={{width: `${(clip.fadeOut / Math.max(1, clip.duration)) * 100}%`}} />}
                             <button className="fade-handle in" style={{left: `${(clip.fadeIn / Math.max(1, clip.duration)) * 100}%`}} onPointerDown={(event) => beginDrag(event, clip, "fade-in")} title={`Fade in · ${clip.fadeIn} frames`} />
@@ -3184,7 +3557,7 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
                           <button className="trim-handle right" onPointerDown={(event) => beginDrag(event, clip, activeTool === "roll" ? "roll-end" : activeTool === "ripple" ? "ripple-end" : "trim-end")} />
                         </div>
                       ))}
-                      {project.transitions.filter((transition) => transitionIsValid(project, transition) && project.clips.find((clip) => clip.id === transition.fromClipId)?.trackId === track.id).map((transition) => {
+                      {(virtualTransitionsByTrack[track.id] ?? []).map((transition) => {
                         const toClip = project.clips.find((clip) => clip.id === transition.toClipId);
                         if (!toClip) return null;
                         return (
@@ -3209,6 +3582,11 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
                     </div>
                   ))}
                 </div>
+                {timelineRange && <div
+                  className="timeline-range-overlay"
+                  style={{left: timelineRange.inFrame * pixelsPerFrame, width: Math.max(2, (timelineRange.outFrame - timelineRange.inFrame) * pixelsPerFrame)}}
+                  title={`Timeline range · ${formatTimecode(timelineRange.outFrame - timelineRange.inFrame, project.fps)}`}
+                ><span>IN</span><span>OUT</span></div>}
                 {marquee && (
                   <div className="selection-marquee" style={{left: Math.min(marquee.startX, marquee.x), top: Math.min(marquee.startY, marquee.y), width: Math.abs(marquee.x - marquee.startX), height: Math.abs(marquee.y - marquee.startY)}} />
                 )}

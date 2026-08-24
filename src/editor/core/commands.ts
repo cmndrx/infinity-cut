@@ -58,8 +58,17 @@ export type PlaceMediaCommand = {
   rippleTrackIds?: string[];
   idBase: string;
 };
+export type RangeEditCommand = {
+  type: "range-edit";
+  mode: "lift" | "extract";
+  inFrame: number;
+  outFrame: number;
+  trackIds: string[];
+  includeLinked?: boolean;
+  idBase: string;
+};
 export type RestoreProjectCommand = {type: "restore-project"; project: EditorProject};
-export type TimelineCommand = SplitClipCommand | RippleDeleteCommand | RetimeClipCommand | MoveClipsCommand | TrimClipCommand | CloneClipsCommand | PlaceMediaCommand | RestoreProjectCommand;
+export type TimelineCommand = SplitClipCommand | RippleDeleteCommand | RetimeClipCommand | MoveClipsCommand | TrimClipCommand | CloneClipsCommand | PlaceMediaCommand | RangeEditCommand | RestoreProjectCommand;
 
 export type CommandErrorCode =
   | "INVALID_PROJECT"
@@ -860,6 +869,132 @@ const executePlaceMedia = (project: EditorProject, command: PlaceMediaCommand): 
   });
 };
 
+const executeRangeEdit = (project: EditorProject, command: RangeEditCommand): CommandResult => {
+  if (!Number.isInteger(command.inFrame) || !Number.isInteger(command.outFrame) || command.inFrame < 0 || command.outFrame <= command.inFrame) {
+    return failure(project, {code: "INVALID_SOURCE_RANGE", message: "Timeline In and Out must define a positive whole-frame range"});
+  }
+  if (!command.trackIds.length || new Set(command.trackIds).size !== command.trackIds.length) {
+    return failure(project, {code: "INVALID_TRACK_TARGET", message: "Range edits require at least one unique target track"});
+  }
+  if (!command.idBase.trim()) return failure(project, {code: "INVALID_COMMAND", message: "Range edits require a deterministic id base"});
+  const tracksById = new Map(project.tracks.map((track) => [track.id, track]));
+  const missingTrack = command.trackIds.find((id) => !tracksById.has(id));
+  if (missingTrack) return failure(project, {code: "TRACK_NOT_FOUND", message: `Track ${missingTrack} was not found`, entityId: missingTrack});
+
+  const intersects = (clip: EditorClip) => clip.start < command.outFrame && clip.start + clip.duration > command.inFrame;
+  const affectedTrackIds = new Set(command.trackIds);
+  if (command.includeLinked !== false) {
+    let changed = true;
+    while (changed) {
+      changed = false;
+      const touchedGroups = new Set(project.clips
+        .filter((clip) => affectedTrackIds.has(clip.trackId) && intersects(clip) && clip.linkedGroupId)
+        .map((clip) => clip.linkedGroupId as string));
+      for (const clip of project.clips) {
+        if (clip.linkedGroupId && touchedGroups.has(clip.linkedGroupId) && !affectedTrackIds.has(clip.trackId)) {
+          affectedTrackIds.add(clip.trackId);
+          changed = true;
+        }
+      }
+    }
+  }
+  const lockedTrack = [...affectedTrackIds].map((id) => tracksById.get(id)).find((track) => track?.locked);
+  if (lockedTrack) return failure(project, {code: "TRACK_LOCKED", message: `${lockedTrack.name} is locked`, entityId: lockedTrack.id});
+
+  const usedClipIds = new Set(project.clips.map((clip) => clip.id));
+  const usedKeyframeIds = new Set(project.clips.flatMap((clip) => clip.keyframes.map((keyframe) => keyframe.id)));
+  const usedGroupIds = new Set(project.clips.flatMap((clip) => clip.linkedGroupId ? [clip.linkedGroupId] : []));
+  const rightGroupByOriginal = new Map<string, string>();
+  const rightByOriginal = new Map<string, string>();
+  const removedClipIds: string[] = [];
+  const affectedClipIds = new Set<string>();
+  const fragments: EditorClip[] = [];
+
+  for (const clip of project.clips) {
+    if (!affectedTrackIds.has(clip.trackId) || !intersects(clip)) {
+      fragments.push({...clip});
+      continue;
+    }
+    affectedClipIds.add(clip.id);
+    const clipEnd = clip.start + clip.duration;
+    const keepLeft = clip.start < command.inFrame;
+    const keepRight = clipEnd > command.outFrame;
+    if (!keepLeft && !keepRight) {
+      removedClipIds.push(clip.id);
+      continue;
+    }
+    if (keepLeft) {
+      const duration = command.inFrame - clip.start;
+      fragments.push({
+        ...clip,
+        duration,
+        fadeIn: Math.min(clip.fadeIn, duration),
+        fadeOut: 0,
+        keyframes: clip.keyframes.filter((keyframe) => keyframe.frame < duration).map((keyframe) => ({...keyframe})),
+      });
+    }
+    if (keepRight) {
+      const offset = Math.max(0, command.outFrame - clip.start);
+      const duration = clipEnd - command.outFrame;
+      const id = keepLeft ? uniqueId(`${command.idBase}-${clip.id}-right`, usedClipIds) : clip.id;
+      if (keepLeft) rightByOriginal.set(clip.id, id);
+      let linkedGroupId = clip.linkedGroupId;
+      if (keepLeft && linkedGroupId) {
+        if (!rightGroupByOriginal.has(linkedGroupId)) rightGroupByOriginal.set(linkedGroupId, uniqueId(`${command.idBase}-${linkedGroupId}-right`, usedGroupIds));
+        linkedGroupId = rightGroupByOriginal.get(linkedGroupId);
+      }
+      fragments.push({
+        ...clip,
+        id,
+        name: keepLeft ? `${clip.name} B` : clip.name,
+        linkedGroupId,
+        start: command.outFrame,
+        duration,
+        sourceStart: clip.sourceStart + offset * (clip.playbackRate ?? 1),
+        fadeIn: 0,
+        fadeOut: Math.min(clip.fadeOut, duration),
+        keyframes: clip.keyframes.filter((keyframe) => keyframe.frame >= offset).map((keyframe) => ({
+          ...keyframe,
+          id: keepLeft ? uniqueId(`${command.idBase}-${keyframe.id}-right`, usedKeyframeIds) : keyframe.id,
+          frame: keyframe.frame - offset,
+        })),
+      });
+    }
+  }
+
+  const rangeDuration = command.outFrame - command.inFrame;
+  const removedIds = new Set(removedClipIds);
+  const touchedOriginalIds = new Set(affectedClipIds);
+  const baseShifts = new Map<string, number>();
+  if (command.mode === "extract") {
+    for (const clip of project.clips) {
+      if (!touchedOriginalIds.has(clip.id) && affectedTrackIds.has(clip.trackId) && clip.start >= command.outFrame) baseShifts.set(clip.id, -rangeDuration);
+    }
+  }
+  const synchronized = synchronizeShifts(project, baseShifts, new Set([...removedIds, ...touchedOriginalIds]));
+  if (!synchronized.ok) return failure(project, {
+    code: synchronized.reason === "locked" ? "TRACK_LOCKED" : "LINKED_OPERATION_CONFLICT",
+    message: synchronized.reason === "locked" ? "Extract would move media on a locked track" : "Extract would desynchronize linked media",
+    entityId: synchronized.clipId,
+  });
+
+  const changed: EditorProject = {
+    ...project,
+    clips: fragments.map((clip) => ({
+      ...clip,
+      start: clip.start + (command.mode === "extract" && affectedTrackIds.has(clip.trackId) && clip.start >= command.outFrame
+        ? -rangeDuration
+        : synchronized.shifts.get(clip.id) ?? 0),
+    })),
+    transitions: project.transitions.map((transition) => ({...transition, fromClipId: rightByOriginal.get(transition.fromClipId) ?? transition.fromClipId})),
+  };
+  return finish(project, changed, {
+    affectedClipIds: [...new Set([...affectedClipIds, ...synchronized.shifts.keys()])],
+    createdClipIds: [...rightByOriginal.values()],
+    removedClipIds,
+  });
+};
+
 const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value);
 const isFiniteNumber = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value);
 const isJsonSerializable = (value: unknown) => {
@@ -931,6 +1066,10 @@ const isTimelineCommand = (value: unknown): value is TimelineCommand => {
       && (item.sourceStart === undefined || isFiniteNumber(item.sourceStart))
       && (item.linkedKey === undefined || typeof item.linkedKey === "string"))
     && (value.rippleTrackIds === undefined || (Array.isArray(value.rippleTrackIds) && value.rippleTrackIds.every((id) => typeof id === "string")));
+  if (value.type === "range-edit") return (value.mode === "lift" || value.mode === "extract")
+    && Number.isInteger(value.inFrame) && Number.isInteger(value.outFrame)
+    && Array.isArray(value.trackIds) && value.trackIds.every((id) => typeof id === "string")
+    && typeof value.idBase === "string" && optionalBoolean("includeLinked");
   return value.type === "restore-project" && isRecord(value.project);
 };
 
@@ -959,7 +1098,9 @@ export const executeTimelineCommand = (input: EditorProject, command: TimelineCo
             ? executeTrim(prepared.project, command)
             : command.type === "clone-clips"
               ? executeClone(prepared.project, command)
-              : executePlaceMedia(prepared.project, command);
+              : command.type === "place-media"
+                ? executePlaceMedia(prepared.project, command)
+                : executeRangeEdit(prepared.project, command);
   if (!result.ok) return {...result, project: cloneProject(input)};
   return result;
 };
@@ -971,3 +1112,4 @@ export const moveClips = (project: EditorProject, command: Omit<MoveClipsCommand
 export const trimClip = (project: EditorProject, command: Omit<TrimClipCommand, "type">) => executeTimelineCommand(project, {type: "trim-clip", ...command});
 export const cloneClips = (project: EditorProject, command: Omit<CloneClipsCommand, "type">) => executeTimelineCommand(project, {type: "clone-clips", ...command});
 export const placeMedia = (project: EditorProject, command: Omit<PlaceMediaCommand, "type">) => executeTimelineCommand(project, {type: "place-media", ...command});
+export const editTimelineRange = (project: EditorProject, command: Omit<RangeEditCommand, "type">) => executeTimelineCommand(project, {type: "range-edit", ...command});

@@ -8,9 +8,13 @@ import {matteFrameAt, objectMatteCss, type ObjectMatteReference} from "./mattes/
 import type {ColorCurvePoint, EditorClip, EditorEffectMask, EditorProject, EditorTransition, MaskProperty} from "./types";
 import {DEFAULT_CAPTION_STYLE, DEFAULT_TITLE_STYLE} from "./types";
 import {projectViewForSequence} from "./sequences";
+import {resolveClipPreviewSource} from "./proxy";
+import {usableRenderCache} from "./render-cache";
 
 export type EditorCompositionProps = {
   project: EditorProject;
+  useProxies?: boolean;
+  useRenderCache?: boolean;
 };
 
 const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value));
@@ -238,7 +242,7 @@ const EffectOverlayLayer: React.FC<{overlay: EffectOverlay; localFrame: number; 
 
 const EffectFailureBadge: React.FC<{errors: string[]}> = ({errors}) => errors.length ? <div style={{position: "absolute", zIndex: 50, left: 22, top: 22, maxWidth: "72%", padding: "10px 14px", border: "2px solid #ff4f76", borderRadius: 6, background: "rgba(38,3,13,.92)", color: "#ffd5df", font: "700 16px Inter, Arial, sans-serif", boxShadow: "0 8px 28px rgba(0,0,0,.48)"}}>EFFECT RENDER ERROR · {errors.join(" · ")}</div> : null;
 
-const VisualClip: React.FC<{clip: EditorClip; frameOffset: number; audioMultiplier: number; offline?: boolean; mediaName?: string; incoming?: EditorTransition; outgoing?: EditorTransition}> = ({clip, frameOffset, audioMultiplier, offline, mediaName, incoming, outgoing}) => {
+const VisualClip: React.FC<{clip: EditorClip; frameOffset: number; audioMultiplier: number; previewSrc?: string; offline?: boolean; mediaName?: string; incoming?: EditorTransition; outgoing?: EditorTransition}> = ({clip, frameOffset, audioMultiplier, previewSrc, offline, mediaName, incoming, outgoing}) => {
   const renderableClip = clip as RenderableEditorClip;
   const localFrame = useCurrentFrame() + frameOffset;
   const gradeFilterId = clip.colorGrade ? `grade-${clip.id.replace(/[^a-zA-Z0-9_-]/g, "-")}` : undefined;
@@ -250,11 +254,11 @@ const VisualClip: React.FC<{clip: EditorClip; frameOffset: number; audioMultipli
   const wrapperStyle = incomingActive ? transitionStyle(clip, incoming, "incoming", localFrame) : outgoingActive ? transitionStyle(clip, outgoing, "outgoing", localFrame) : {};
   const maskedTreatment = Boolean(clip.effects.enabled && (clip.effects.maskEnabled || clip.effectMasks?.some((mask) => mask.enabled && mask.target === "color")) && (clip.kind === "video" || clip.kind === "image"));
   const renderMedia = (mediaStyle: React.CSSProperties, withAudio: boolean) => {
-    if (clip.kind === "video" && clip.src) {
+    if (clip.kind === "video" && previewSrc) {
       const playbackRate = getClipPlaybackRate(clip);
       return (
         <OffthreadVideo
-          src={resolveMediaSource(clip.src)}
+          src={resolveMediaSource(previewSrc)}
           trimBefore={Math.max(0, clip.sourceStart + frameOffset * playbackRate)}
           playbackRate={playbackRate}
           preservePitch={clip.preservePitch ?? true}
@@ -264,7 +268,7 @@ const VisualClip: React.FC<{clip: EditorClip; frameOffset: number; audioMultipli
         />
       );
     }
-    if (clip.kind === "image" && clip.src) return <Img src={resolveMediaSource(clip.src)} style={{...mediaStyle, objectFit: "cover"}} />;
+    if (clip.kind === "image" && previewSrc) return <Img src={resolveMediaSource(previewSrc)} style={{...mediaStyle, objectFit: "cover"}} />;
     return null;
   };
   const effectOverlays = effectPlan.overlays.map((overlay) => <EffectOverlayLayer key={overlay.id} overlay={overlay} localFrame={localFrame} renderMedia={renderMedia} />);
@@ -279,7 +283,7 @@ const VisualClip: React.FC<{clip: EditorClip; frameOffset: number; audioMultipli
       </AbsoluteFill>
     );
   }
-  if ((clip.kind === "video" || clip.kind === "image") && clip.src) {
+  if ((clip.kind === "video" || clip.kind === "image") && previewSrc) {
     if (maskedTreatment) {
       return <><AdvancedGradeFilter clip={clip} id={gradeFilterId ?? `grade-${clip.id}`} />{renderMedia(baseStyle, true)}<AbsoluteFill style={effectMaskStyle(clip, localFrame)}>{renderMedia(style, false)}<TreatmentOverlays clip={clip} localFrame={localFrame} />{effectOverlays}</AbsoluteFill></>;
     }
@@ -333,7 +337,25 @@ const VisualClip: React.FC<{clip: EditorClip; frameOffset: number; audioMultipli
   return <AbsoluteFill data-editor-clip-id={clip.id} data-editor-track-id={clip.trackId} style={{overflow: "hidden", ...wrapperStyle}}><AbsoluteFill style={enabledMatte ? objectMatteCss(enabledMatte, localFrame) : undefined}>{content}{!offline && !maskedTreatment && <TreatmentOverlays clip={clip} localFrame={localFrame} />}{!offline && !maskedTreatment && effectOverlays}</AbsoluteFill><EffectFailureBadge errors={[...effectPlan.errors, ...(matteMissing ? [`Object matte has no frame: ${enabledMatte.name}`] : [])]} /></AbsoluteFill>;
 };
 
-const EditorTimeline: React.FC<EditorCompositionProps & {ancestors: string[]}> = ({project, ancestors}) => {
+const CachedAudioTimeline: React.FC<EditorCompositionProps & {ancestors: string[]}> = ({project, ancestors, useProxies = false}) => {
+  const audioSoloActive = project.tracks.some((track) => track.kind === "audio" && track.solo);
+  return <>{project.clips.map((clip) => {
+    const track = project.tracks.find((candidate) => candidate.id === clip.trackId);
+    const sourceMedia = project.media.find((item) => item.id === clip.sourceMediaId);
+    if (track?.hidden || sourceMedia?.offline) return null;
+    if (clip.kind === "sequence" && clip.nestedSequenceId && !ancestors.includes(clip.nestedSequenceId)) {
+      const nested = projectViewForSequence(project, clip.nestedSequenceId);
+      if (!nested) return null;
+      return <Sequence key={clip.id} from={clip.start} durationInFrames={clip.duration}><Sequence from={-Math.round(clip.sourceStart)} durationInFrames={nested.durationInFrames}><CachedAudioTimeline project={nested} ancestors={[...ancestors, clip.nestedSequenceId]} useProxies={useProxies} /></Sequence></Sequence>;
+    }
+    if ((clip.kind !== "audio" && clip.kind !== "video") || !clip.src) return null;
+    const trackAudible = clip.kind === "audio" ? !track?.muted && (!audioSoloActive || Boolean(track?.solo)) : !track?.muted;
+    const trackMultiplier = trackAudible ? (track?.volume ?? 1) : 0;
+    return <Sequence key={clip.id} from={clip.start} durationInFrames={clip.duration}><div data-editor-clip-id={clip.id} data-editor-track-id={clip.trackId}><Html5Audio src={resolveMediaSource(resolveClipPreviewSource(clip, project.media, useProxies) ?? clip.src)} trimBefore={clip.sourceStart} playbackRate={getClipPlaybackRate(clip)} preservePitch={clip.preservePitch ?? true} pauseWhenBuffering={false} volume={(frame) => clipAudioVolume(clip, frame) * trackMultiplier} /></div></Sequence>;
+  })}</>;
+};
+
+const EditorTimeline: React.FC<EditorCompositionProps & {ancestors: string[]}> = ({project, ancestors, useProxies = false, useRenderCache = false}) => {
   const trackOrder = new Map(project.tracks.map((track, index) => [track.id, index]));
   const visibleClips = project.clips
     .filter((clip) => {
@@ -349,6 +371,10 @@ const EditorTimeline: React.FC<EditorCompositionProps & {ancestors: string[]}> =
   });
   const audioSoloActive = project.tracks.some((track) => track.kind === "audio" && track.solo);
 
+  if (ancestors.length === 1 && useRenderCache && usableRenderCache(project)) {
+    return <AbsoluteFill style={{backgroundColor: "#05060a", overflow: "hidden"}} data-render-cache="active"><OffthreadVideo src={resolveMediaSource(project.renderCache!.url!)} volume={0} pauseWhenBuffering={false} style={{width: "100%", height: "100%", objectFit: "cover"}} /><CachedAudioTimeline project={project} ancestors={ancestors} useProxies={useProxies} /><AbsoluteFill style={{pointerEvents: "none", boxShadow: "inset 0 0 160px rgba(0,0,0,.52)", background: "linear-gradient(180deg, rgba(0,0,0,.06), transparent 45%, rgba(0,0,0,.2))"}} /></AbsoluteFill>;
+  }
+
   return (
     <AbsoluteFill style={{backgroundColor: "#05060a", overflow: "hidden"}}>
       {visibleClips.map((clip) => {
@@ -360,7 +386,7 @@ const EditorTimeline: React.FC<EditorCompositionProps & {ancestors: string[]}> =
           return (
             <Sequence key={clip.id} from={clip.start} durationInFrames={clip.duration} premountFor={Math.min(project.fps, clip.duration)}>
               <Sequence from={-Math.round(clip.sourceStart)} durationInFrames={nested.durationInFrames}>
-                <EditorTimeline project={nested} ancestors={[...ancestors, clip.nestedSequenceId]} />
+                <EditorTimeline project={nested} ancestors={[...ancestors, clip.nestedSequenceId]} useProxies={useProxies} />
               </Sequence>
             </Sequence>
           );
@@ -373,7 +399,7 @@ const EditorTimeline: React.FC<EditorCompositionProps & {ancestors: string[]}> =
             <Sequence key={clip.id} from={clip.start} durationInFrames={clip.duration}>
               <div data-editor-clip-id={clip.id} data-editor-track-id={clip.trackId}>
               <Html5Audio
-                src={resolveMediaSource(clip.src)}
+                src={resolveMediaSource(resolveClipPreviewSource(clip, project.media, useProxies) ?? clip.src)}
                 trimBefore={clip.sourceStart}
                 playbackRate={getClipPlaybackRate(clip)}
                 preservePitch={clip.preservePitch ?? true}
@@ -393,10 +419,11 @@ const EditorTimeline: React.FC<EditorCompositionProps & {ancestors: string[]}> =
         const outgoingExtension = Math.ceil((outgoing?.duration ?? 0) / 2);
         const sequenceEnd = Math.min(project.durationInFrames, clip.start + clip.duration + outgoingExtension);
         const trackMultiplier = track?.muted ? 0 : (track?.volume ?? 1);
+        const previewSrc = resolveClipPreviewSource(clip, project.media, useProxies);
 
         return (
           <Sequence key={clip.id} from={sequenceFrom} durationInFrames={Math.max(1, sequenceEnd - sequenceFrom)}>
-            <VisualClip clip={clip} frameOffset={frameOffset} audioMultiplier={trackMultiplier} offline={sourceMedia?.offline} mediaName={sourceMedia?.name} incoming={incoming} outgoing={outgoing} />
+            <VisualClip clip={clip} frameOffset={frameOffset} audioMultiplier={trackMultiplier} previewSrc={previewSrc} offline={sourceMedia?.offline} mediaName={sourceMedia?.name} incoming={incoming} outgoing={outgoing} />
           </Sequence>
         );
       })}
@@ -411,6 +438,6 @@ const EditorTimeline: React.FC<EditorCompositionProps & {ancestors: string[]}> =
   );
 };
 
-export const EditorComposition: React.FC<EditorCompositionProps> = ({project}) => (
-  <EditorTimeline project={project} ancestors={[project.activeSequenceId]} />
+export const EditorComposition: React.FC<EditorCompositionProps> = ({project, useProxies = false, useRenderCache = false}) => (
+  <EditorTimeline project={project} ancestors={[project.activeSequenceId]} useProxies={useProxies} useRenderCache={useRenderCache} />
 );
