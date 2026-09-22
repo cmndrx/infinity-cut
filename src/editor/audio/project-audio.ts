@@ -62,13 +62,13 @@ const linearToDb = (gain: number) => gain <= 0 ? -100 : Math.max(-100, Math.min(
 
 export type AudioInputBinding = {inputIndex: number; audioStreamIndex?: number};
 
-/** Builds the single deterministic mix contract used by preview and final export. */
+/** Final-export mix, with clip-local automation using the preview's easing semantics. */
 export const buildProjectAudioMix = (
   project: EditorProject,
   resolveInput: (clipId: string) => AudioInputBinding | undefined,
 ): AudioMix => {
   const settings = normalizeProjectAudioSettings(project.audioSettings);
-  const tracks = project.tracks.filter((track) => track.kind === "audio" || project.clips.some((clip) => clip.trackId === track.id && clip.kind === "video"))
+  const tracks = project.tracks.filter((track) => track.kind === "audio" || project.clips.some((clip) => clip.trackId === track.id && (clip.kind === "video" || clip.kind === "sequence")))
     .map((track) => normalizeTrackAudio(track, settings));
   const trackIds = new Set(tracks.map((track) => track.id));
   const mix: AudioMix = {
@@ -82,13 +82,13 @@ export const buildProjectAudioMix = (
       busId: track.audioBusId ?? settings.masterBusId,
       gainDb: linearToDb(track.volume),
       pan: track.audioPan ?? 0,
-      muted: track.muted,
-      solo: track.solo,
+      muted: track.muted || track.hidden || (track.kind === "audio" && project.tracks.some((item) => item.kind === "audio" && item.solo) && !track.solo),
+      solo: false,
       processors: clone(track.audioProcessors ?? []),
     })),
     clips: project.clips.flatMap((clip) => {
       const input = resolveInput(clip.id);
-      if (!input || !trackIds.has(clip.trackId) || !clip.src || (clip.kind !== "audio" && clip.kind !== "video")) return [];
+      if (!input || !trackIds.has(clip.trackId) || (clip.kind !== "sequence" && (!clip.src || (clip.kind !== "audio" && clip.kind !== "video")))) return [];
       const durationFrames = Math.min(clip.duration, project.durationInFrames - clip.start);
       if (durationFrames < 1) return [];
       return [{
@@ -99,6 +99,8 @@ export const buildProjectAudioMix = (
         durationFrames,
         sourceStartFrame: clip.sourceStart,
         playbackRate: clip.playbackRate ?? 1,
+        preservePitch: clip.preservePitch ?? true,
+        volumeKeyframes: (clip.keyframes ?? []).filter((key) => key.property === "audio.volume").map(({frame, value, easing}) => ({frame, value, easing})),
         gainDb: linearToDb(clip.volume),
         pan: clamp(clip.audioPan, 0, -1, 1),
         fadeInFrames: Math.min(durationFrames, Math.max(0, Math.round(clip.fadeIn))),

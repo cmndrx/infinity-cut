@@ -1,4 +1,4 @@
-import {assertValidAudioMix, type AudioMix, type AudioProcessor} from "./model";
+import {assertValidAudioMix, type AudioClipMix, type AudioMix, type AudioProcessor} from "./model";
 
 export type FfmpegAudioGraph = {filterComplex: string; outputLabel: string};
 
@@ -9,7 +9,22 @@ const decimal = (value: number) => {
 const seconds = (frames: number, fps: number) => decimal(frames / fps);
 const linearGain = (db: number) => decimal(10 ** (db / 20));
 
+export const volumeAutomationExpression = (keys: NonNullable<AudioClipMix["volumeKeyframes"]>, fps: number) => {
+  const sorted = [...keys].sort((a, b) => a.frame - b.frame);
+  if (!sorted.length) return "1";
+  let expression = decimal(sorted[sorted.length - 1].value);
+  for (let index = sorted.length - 1; index > 0; index--) {
+    const left = sorted[index - 1];
+    const right = sorted[index];
+    const p = `((t*${decimal(fps)}-${decimal(left.frame)})/${decimal(Math.max(1, right.frame - left.frame))})`;
+    const eased = right.easing === "ease-in-out" ? `(${p}*${p}*(3-2*${p}))` : p;
+    expression = `if(lte(t*${decimal(fps)},${decimal(right.frame)}),${decimal(left.value)}+(${decimal(right.value - left.value)})*${eased},${expression})`;
+  }
+  return `max(0,if(lte(t*${decimal(fps)},${decimal(sorted[0].frame)}),${decimal(sorted[0].value)},${expression}))`;
+};
+
 const atempo = (rate: number) => {
+  if (rate === 1) return [];
   const factors: number[] = [];
   let remaining = rate;
   while (remaining > 2) {
@@ -52,8 +67,9 @@ const channelFilters = (gainDb: number, pan: number, muted: boolean, processors:
   panFilter(pan),
 ];
 
+// Rebase mixed timestamps before padding; delayed/trimmed inputs may carry discontinuities.
 const mixTo = (inputs: string[], output: string, duration: string, sampleRate: number) => inputs.length
-  ? `${inputs.map((label) => `[${label}]`).join("")}amix=inputs=${inputs.length}:duration=longest:normalize=0,atrim=duration=${duration},aresample=${sampleRate}[${output}]`
+  ? `${inputs.map((label) => `[${label}]`).join("")}amix=inputs=${inputs.length}:duration=longest:normalize=0,asetpts=N/SR/TB,apad,atrim=duration=${duration},aresample=${sampleRate}[${output}]`
   : `anullsrc=r=${sampleRate}:cl=stereo,atrim=duration=${duration}[${output}]`;
 
 export const buildFfmpegAudioGraph = (mix: AudioMix): FfmpegAudioGraph => {
@@ -69,11 +85,14 @@ export const buildFfmpegAudioGraph = (mix: AudioMix): FfmpegAudioGraph => {
     const filters = [
       `atrim=start=${seconds(clip.sourceStartFrame, mix.fps)}:duration=${seconds(clip.durationFrames * clip.playbackRate, mix.fps)}`,
       "asetpts=PTS-STARTPTS",
-      ...atempo(clip.playbackRate),
+      ...(clip.preservePitch === false ? [`aresample=${mix.sampleRate}`, `asetrate=${decimal(mix.sampleRate * clip.playbackRate)}`, `aresample=${mix.sampleRate}`] : atempo(clip.playbackRate)),
     ];
     if (clip.fadeInFrames) filters.push(`afade=t=in:st=0:d=${seconds(clip.fadeInFrames, mix.fps)}:curve=qsin`);
     if (clip.fadeOutFrames) filters.push(`afade=t=out:st=${seconds(clip.durationFrames - clip.fadeOutFrames, mix.fps)}:d=${seconds(clip.fadeOutFrames, mix.fps)}:curve=qsin`);
-    filters.push(...channelFilters(clip.gainDb, clip.pan, clip.muted, clip.processors));
+    const automated = Boolean(clip.volumeKeyframes?.length);
+    filters.push("aformat=sample_fmts=fltp:channel_layouts=stereo");
+    filters.push(...channelFilters(automated ? 0 : clip.gainDb, clip.pan, clip.muted, clip.processors));
+    if (automated) filters.push("asetnsamples=n=128:p=0", `volume='${volumeAutomationExpression(clip.volumeKeyframes!, mix.fps)}':eval=frame`);
     filters.push(`adelay=${decimal((clip.startFrame / mix.fps) * 1000)}|${decimal((clip.startFrame / mix.fps) * 1000)}`);
     graph.push(`[${input}]${filters.join(",")}[${output}]`);
   }

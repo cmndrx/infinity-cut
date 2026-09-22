@@ -1,11 +1,14 @@
 import React from "react";
+import {GradedMedia} from "./GradedMedia";
+import {gradeRequiresProcessing} from "./grade-texture";
 import {AbsoluteFill, Html5Audio, Img, OffthreadVideo, Sequence, staticFile, useCurrentFrame} from "remotion";
 import {getAnimatedPropertyValue} from "./animation";
 import {getClipPlaybackRate} from "./clip-speed";
 import {buildEffectRenderPlan, deterministicEffectNoise, type EffectOverlay} from "./effects/render-plan";
 import type {VisualEffectInstance} from "./effects/registry";
 import {matteFrameAt, objectMatteCss, type ObjectMatteReference} from "./mattes/object-matte";
-import type {ColorCurvePoint, EditorClip, EditorEffectMask, EditorProject, EditorTransition, MaskProperty} from "./types";
+import type {EditorClip, EditorProject, EditorTransition, ProjectLut, MaskTarget} from "./types";
+import {effectMaskImage} from "./mask-image";
 import {DEFAULT_CAPTION_STYLE, DEFAULT_TITLE_STYLE} from "./types";
 import {projectViewForSequence} from "./sequences";
 import {resolveClipPreviewSource} from "./proxy";
@@ -39,8 +42,9 @@ const visualStyle = (clip: EditorClip, localFrame: number, processed = true, gra
   const saturation = colorEnabled ? getAnimatedPropertyValue(clip, "effects.saturation", localFrame) : 100;
   const vibrance = colorEnabled ? getAnimatedPropertyValue(clip, "effects.vibrance", localFrame) : 0;
   const hue = colorEnabled ? getAnimatedPropertyValue(clip, "effects.hue", localFrame) : 0;
-  const blur = effectsEnabled && clip.effects.blurEnabled ? getAnimatedPropertyValue(clip, "effects.blur", localFrame) : 0;
-  const glow = effectsEnabled && clip.effects.glowEnabled ? getAnimatedPropertyValue(clip, "effects.glow", localFrame) : 0;
+  const maskedMediaBlur = (clip.kind === "video" || clip.kind === "image") && hasTargetMask(clip, "blur");
+  const blur = effectsEnabled && clip.effects.blurEnabled && !maskedMediaBlur ? getAnimatedPropertyValue(clip, "effects.blur", localFrame) : 0;
+  const glow = effectsEnabled && clip.effects.glowEnabled && !hasTargetMask(clip, "glow") ? getAnimatedPropertyValue(clip, "effects.glow", localFrame) : 0;
   const tonalBrightness = clamp(brightness * (2 ** exposure) * (1 + (highlights * .35 + shadows * .22 + whites * .42 + blacks * .18) / 400), 1, 500);
   const tonalContrast = clamp((contrast + sharpen * .16 + whites * .1 - blacks * .12) * (1 - fade * .0042), 0, 300);
   const tonalSaturation = clamp(saturation * (1 + vibrance / 170), 0, 300);
@@ -55,43 +59,19 @@ const visualStyle = (clip: EditorClip, localFrame: number, processed = true, gra
   };
 };
 
-const interpolateMaskProperty = (mask: EditorEffectMask, property: MaskProperty, frame: number) => {
-  const keyframes = mask.keyframes.filter((item) => item.property === property).sort((left, right) => left.frame - right.frame);
-  if (!keyframes.length) return mask[property];
-  if (frame <= keyframes[0].frame) return keyframes[0].value;
-  if (frame >= keyframes[keyframes.length - 1].frame) return keyframes[keyframes.length - 1].value;
-  const rightIndex = keyframes.findIndex((item) => item.frame >= frame);
-  const left = keyframes[rightIndex - 1];
-  const right = keyframes[rightIndex];
-  const progress = (frame - left.frame) / Math.max(1, right.frame - left.frame);
-  const eased = right.easing === "ease-in-out" ? progress * progress * (3 - 2 * progress) : progress;
-  return left.value + (right.value - left.value) * eased;
-};
-
-const maskGradient = (mask: EditorEffectMask, localFrame: number) => {
-  const x = interpolateMaskProperty(mask, "x", localFrame);
-  const y = interpolateMaskProperty(mask, "y", localFrame);
-  const width = interpolateMaskProperty(mask, "width", localFrame);
-  const height = interpolateMaskProperty(mask, "height", localFrame);
-  const feather = clamp(interpolateMaskProperty(mask, "feather", localFrame), 0, 100);
-  const solid = clamp(100 - feather, 0, 100);
-  const shape = mask.shape === "rectangle" ? "ellipse" : "ellipse";
-  const core = `${shape} ${Math.max(1, width / 2)}% ${Math.max(1, height / 2)}% at ${x}% ${y}%`;
-  return mask.inverted
-    ? `radial-gradient(${core}, transparent 0%, transparent ${solid}%, rgba(0,0,0,${mask.opacity / 100}) 100%)`
-    : `radial-gradient(${core}, rgba(0,0,0,${mask.opacity / 100}) 0%, rgba(0,0,0,${mask.opacity / 100}) ${solid}%, transparent 100%)`;
-};
-
-const effectMaskStyle = (clip: EditorClip, localFrame: number): React.CSSProperties => {
-  const masks = (clip.effectMasks ?? []).filter((mask) => mask.enabled && mask.target === "color");
+export const hasTargetMask = (clip: EditorClip, target: MaskTarget) => Boolean(clip.effects.enabled && clip.effectMasks?.some((mask) => mask.enabled && mask.target === target));
+export const effectMaskStyle = (clip: EditorClip, localFrame: number, target: MaskTarget = "color"): React.CSSProperties => {
+  if (!clip.effects.enabled) return {};
+  const masks = (clip.effectMasks ?? []).filter((mask) => mask.enabled && mask.target === target);
   if (masks.length) {
     return {
-      WebkitMaskImage: masks.map((mask) => maskGradient(mask, localFrame)).join(", "),
-      maskImage: masks.map((mask) => maskGradient(mask, localFrame)).join(", "),
+      WebkitMaskImage: masks.map((mask) => effectMaskImage(mask, localFrame)).join(", "),
+      maskImage: masks.map((mask) => effectMaskImage(mask, localFrame)).join(", "),
       WebkitMaskComposite: masks.slice(1).map((mask) => mask.combineMode === "subtract" ? "destination-out" : mask.combineMode === "intersect" ? "source-in" : "source-over").join(", ") as React.CSSProperties["WebkitMaskComposite"],
       maskComposite: masks.slice(1).map((mask) => mask.combineMode).join(", ") as React.CSSProperties["maskComposite"],
     };
   }
+  if (target !== "color" || !clip.effects.maskEnabled) return {};
   const featherStart = clamp(100 - clip.effects.maskFeather, 0, 100);
   const gradient = clip.effects.maskInverted
     ? `radial-gradient(ellipse ${clip.effects.maskSize}% ${clip.effects.maskSize}% at ${clip.effects.maskX}% ${clip.effects.maskY}%, transparent 0%, transparent ${featherStart}%, black 100%)`
@@ -99,50 +79,20 @@ const effectMaskStyle = (clip: EditorClip, localFrame: number): React.CSSPropert
   return {WebkitMaskImage: gradient, maskImage: gradient};
 };
 
-const curveTable = (points: ColorCurvePoint[] | undefined) => {
-  const ordered = [...(points ?? [{id: "black", x: 0, y: 0}, {id: "white", x: 1, y: 1}])].sort((left, right) => left.x - right.x);
-  return Array.from({length: 17}, (_, index) => {
-    const input = index / 16;
-    const rightIndex = ordered.findIndex((point) => point.x >= input);
-    if (rightIndex <= 0) return ordered[0]?.y ?? input;
-    const left = ordered[rightIndex - 1];
-    const right = ordered[rightIndex];
-    const progress = (input - left.x) / Math.max(Number.EPSILON, right.x - left.x);
-    return clamp(left.y + (right.y - left.y) * progress, 0, 1);
-  }).join(" ");
-};
-
-const AdvancedGradeFilter: React.FC<{clip: EditorClip; id: string}> = ({clip, id}) => {
-  const grade = clip.colorGrade;
-  if (!grade) return null;
-  return <svg width="0" height="0" aria-hidden="true" style={{position: "absolute"}}><filter id={id} colorInterpolationFilters="sRGB">
-    <feComponentTransfer>
-      <feFuncR type="table" tableValues={curveTable(grade.curves.master)} />
-      <feFuncG type="table" tableValues={curveTable(grade.curves.master)} />
-      <feFuncB type="table" tableValues={curveTable(grade.curves.master)} />
-    </feComponentTransfer>
-    <feComponentTransfer>
-      <feFuncR type="table" tableValues={curveTable(grade.curves.red)} />
-      <feFuncG type="table" tableValues={curveTable(grade.curves.green)} />
-      <feFuncB type="table" tableValues={curveTable(grade.curves.blue)} />
-    </feComponentTransfer>
-  </filter></svg>;
-};
-
-const TreatmentOverlays: React.FC<{clip: EditorClip; localFrame: number}> = ({clip, localFrame}) => {
+const TreatmentOverlays: React.FC<{clip: EditorClip; localFrame: number; mode?: "color" | "finishing" | "all"}> = ({clip, localFrame, mode = "all"}) => {
   if (!clip.effects.enabled) return null;
-  const colorEnabled = clip.effects.colorEnabled;
+  const colorEnabled = clip.effects.colorEnabled && mode !== "finishing";
   const temperature = colorEnabled ? getAnimatedPropertyValue(clip, "effects.temperature", localFrame) : 0;
   const tint = colorEnabled ? getAnimatedPropertyValue(clip, "effects.tint", localFrame) : 0;
-  const vignette = clip.effects.vignetteEnabled ? getAnimatedPropertyValue(clip, "effects.vignette", localFrame) : 0;
-  const grain = clip.effects.grainEnabled ? getAnimatedPropertyValue(clip, "effects.grain", localFrame) : 0;
-  const glow = clip.effects.glowEnabled ? getAnimatedPropertyValue(clip, "effects.glow", localFrame) : 0;
+  const vignette = clip.effects.vignetteEnabled && mode !== "color" ? getAnimatedPropertyValue(clip, "effects.vignette", localFrame) : 0;
+  const grain = clip.effects.grainEnabled && mode !== "color" ? getAnimatedPropertyValue(clip, "effects.grain", localFrame) : 0;
+  const glow = clip.effects.glowEnabled && mode !== "color" ? getAnimatedPropertyValue(clip, "effects.glow", localFrame) : 0;
   return <>
-    {temperature !== 0 && <AbsoluteFill style={{backgroundColor: temperature > 0 ? "#ff8a3d" : "#327bff", opacity: Math.abs(temperature) / 430, mixBlendMode: "soft-light"}} />}
-    {tint !== 0 && <AbsoluteFill style={{backgroundColor: tint > 0 ? "#e54bca" : "#49c985", opacity: Math.abs(tint) / 520, mixBlendMode: "soft-light"}} />}
-    {glow > 0 && <AbsoluteFill style={{background: "radial-gradient(circle at 50% 45%, rgba(255,255,255,.6), rgba(255,255,255,.12) 34%, transparent 70%)", opacity: glow / 300, mixBlendMode: "screen"}} />}
-    {vignette > 0 && <AbsoluteFill style={{background: "radial-gradient(ellipse at center, transparent 38%, rgba(0,0,0,.18) 62%, rgba(0,0,0,.92) 100%)", opacity: vignette / 100, mixBlendMode: "multiply"}} />}
-    {grain > 0 && <AbsoluteFill style={{mixBlendMode: "overlay", opacity: grain / 145}}>{Array.from({length: 84}, (_, index) => {
+    {temperature !== 0 && <AbsoluteFill style={{...effectMaskStyle(clip, localFrame, "color"), backgroundColor: temperature > 0 ? "#ff8a3d" : "#327bff", opacity: Math.abs(temperature) / 430, mixBlendMode: "soft-light"}} />}
+    {tint !== 0 && <AbsoluteFill style={{...effectMaskStyle(clip, localFrame, "color"), backgroundColor: tint > 0 ? "#e54bca" : "#49c985", opacity: Math.abs(tint) / 520, mixBlendMode: "soft-light"}} />}
+    {glow > 0 && <AbsoluteFill data-effect-target="glow" style={{...effectMaskStyle(clip, localFrame, "glow"), background: "radial-gradient(circle at 50% 45%, rgba(255,255,255,.6), rgba(255,255,255,.12) 34%, transparent 70%)", opacity: glow / 300, mixBlendMode: "screen"}} />}
+    {vignette > 0 && <AbsoluteFill data-effect-target="vignette" style={{...effectMaskStyle(clip, localFrame, "vignette"), background: "radial-gradient(ellipse at center, transparent 38%, rgba(0,0,0,.18) 62%, rgba(0,0,0,.92) 100%)", opacity: vignette / 100, mixBlendMode: "multiply"}} />}
+    {grain > 0 && <AbsoluteFill data-effect-target="grain" style={{...effectMaskStyle(clip, localFrame, "grain"), mixBlendMode: "overlay", opacity: grain / 145}}>{Array.from({length: 84}, (_, index) => {
       const x = (index * 47 + localFrame * 13) % 100;
       const y = (index * 71 + localFrame * 19) % 100;
       const size = 2 + ((index * 11 + localFrame) % 7);
@@ -242,18 +192,21 @@ const EffectOverlayLayer: React.FC<{overlay: EffectOverlay; localFrame: number; 
 
 const EffectFailureBadge: React.FC<{errors: string[]}> = ({errors}) => errors.length ? <div style={{position: "absolute", zIndex: 50, left: 22, top: 22, maxWidth: "72%", padding: "10px 14px", border: "2px solid #ff4f76", borderRadius: 6, background: "rgba(38,3,13,.92)", color: "#ffd5df", font: "700 16px Inter, Arial, sans-serif", boxShadow: "0 8px 28px rgba(0,0,0,.48)"}}>EFFECT RENDER ERROR · {errors.join(" · ")}</div> : null;
 
-const VisualClip: React.FC<{clip: EditorClip; frameOffset: number; audioMultiplier: number; previewSrc?: string; offline?: boolean; mediaName?: string; incoming?: EditorTransition; outgoing?: EditorTransition}> = ({clip, frameOffset, audioMultiplier, previewSrc, offline, mediaName, incoming, outgoing}) => {
+const VisualClip: React.FC<{clip: EditorClip; luts: ProjectLut[]; frameOffset: number; audioMultiplier: number; previewSrc?: string; offline?: boolean; mediaName?: string; incoming?: EditorTransition; outgoing?: EditorTransition}> = ({clip, luts, frameOffset, audioMultiplier, previewSrc, offline, mediaName, incoming, outgoing}) => {
   const renderableClip = clip as RenderableEditorClip;
   const localFrame = useCurrentFrame() + frameOffset;
-  const gradeFilterId = clip.colorGrade ? `grade-${clip.id.replace(/[^a-zA-Z0-9_-]/g, "-")}` : undefined;
+  const gradeFilterId: string | undefined = undefined; // Curves now belong to the GPU grade, not a second SVG pass.
   const legacyStyle = visualStyle(clip, localFrame, true, gradeFilterId);
   const {plan: effectPlan, style} = combineEffectStyle(legacyStyle, renderableClip, localFrame);
-  const baseStyle = visualStyle(clip, localFrame, false);
+  const baseStyle = combineEffectStyle(visualStyle({...clip, effects: {...clip.effects, colorEnabled: false}}, localFrame, true), renderableClip, localFrame).style;
   const incomingActive = incoming && localFrame <= Math.ceil(incoming.duration / 2);
   const outgoingActive = outgoing && localFrame >= clip.duration - Math.floor(outgoing.duration / 2);
   const wrapperStyle = incomingActive ? transitionStyle(clip, incoming, "incoming", localFrame) : outgoingActive ? transitionStyle(clip, outgoing, "outgoing", localFrame) : {};
   const maskedTreatment = Boolean(clip.effects.enabled && (clip.effects.maskEnabled || clip.effectMasks?.some((mask) => mask.enabled && mask.target === "color")) && (clip.kind === "video" || clip.kind === "image"));
   const renderMedia = (mediaStyle: React.CSSProperties, withAudio: boolean) => {
+    if (clip.colorGrade && gradeRequiresProcessing(clip.colorGrade) && clip.effects.enabled && clip.effects.colorEnabled && mediaStyle !== baseStyle && previewSrc && (clip.kind === "image" || clip.kind === "video")) {
+      return <GradedMedia grade={clip.colorGrade} luts={luts} kind={clip.kind} media={{src: resolveMediaSource(previewSrc), trimBefore: Math.max(0, clip.sourceStart + frameOffset * getClipPlaybackRate(clip)), playbackRate: getClipPlaybackRate(clip), preservePitch: clip.preservePitch ?? true, volume: (frame) => withAudio ? clipAudioVolume(clip, frame + frameOffset) * audioMultiplier : 0, pauseWhenBuffering: false, style: {...mediaStyle, objectFit: "cover"}}} />;
+    }
     if (clip.kind === "video" && previewSrc) {
       const playbackRate = getClipPlaybackRate(clip);
       return (
@@ -272,6 +225,10 @@ const VisualClip: React.FC<{clip: EditorClip; frameOffset: number; audioMultipli
     return null;
   };
   const effectOverlays = effectPlan.overlays.map((overlay) => <EffectOverlayLayer key={overlay.id} overlay={overlay} localFrame={localFrame} renderMedia={renderMedia} />);
+  const mediaContent = (withAudio: boolean) => <>
+    {maskedTreatment ? <>{renderMedia(baseStyle, withAudio)}<AbsoluteFill style={effectMaskStyle(clip, localFrame)}>{renderMedia(style, false)}</AbsoluteFill></> : renderMedia(style, withAudio)}
+    <TreatmentOverlays clip={clip} localFrame={localFrame} mode="color" />
+  </>;
   const content = (() => {
   if (offline) {
     return (
@@ -284,10 +241,7 @@ const VisualClip: React.FC<{clip: EditorClip; frameOffset: number; audioMultipli
     );
   }
   if ((clip.kind === "video" || clip.kind === "image") && previewSrc) {
-    if (maskedTreatment) {
-      return <><AdvancedGradeFilter clip={clip} id={gradeFilterId ?? `grade-${clip.id}`} />{renderMedia(baseStyle, true)}<AbsoluteFill style={effectMaskStyle(clip, localFrame)}>{renderMedia(style, false)}<TreatmentOverlays clip={clip} localFrame={localFrame} />{effectOverlays}</AbsoluteFill></>;
-    }
-    return <><AdvancedGradeFilter clip={clip} id={gradeFilterId ?? `grade-${clip.id}`} />{renderMedia(style, true)}</>;
+    return <>{mediaContent(true)}{clip.effects.blurEnabled && hasTargetMask(clip, "blur") && getAnimatedPropertyValue(clip, "effects.blur", localFrame) > 0 && <AbsoluteFill data-effect-target="blur" style={effectMaskStyle(clip, localFrame, "blur")}><AbsoluteFill style={{filter: `blur(${getAnimatedPropertyValue(clip, "effects.blur", localFrame)}px)`}}>{mediaContent(false)}</AbsoluteFill></AbsoluteFill>}</>;
   }
 
   if (clip.kind === "title" || clip.kind === "caption") {
@@ -334,7 +288,12 @@ const VisualClip: React.FC<{clip: EditorClip; frameOffset: number; audioMultipli
 
   const enabledMatte = renderableClip.objectMattes?.find((matte) => matte.enabled);
   const matteMissing = enabledMatte && !matteFrameAt(enabledMatte, localFrame);
-  return <AbsoluteFill data-editor-clip-id={clip.id} data-editor-track-id={clip.trackId} style={{overflow: "hidden", ...wrapperStyle}}><AbsoluteFill style={enabledMatte ? objectMatteCss(enabledMatte, localFrame) : undefined}>{content}{!offline && !maskedTreatment && <TreatmentOverlays clip={clip} localFrame={localFrame} />}{!offline && !maskedTreatment && effectOverlays}</AbsoluteFill><EffectFailureBadge errors={[...effectPlan.errors, ...(matteMissing ? [`Object matte has no frame: ${enabledMatte.name}`] : [])]} /></AbsoluteFill>;
+  return <AbsoluteFill data-editor-clip-id={clip.id} data-editor-track-id={clip.trackId} style={{overflow: "hidden", ...wrapperStyle}}><AbsoluteFill style={enabledMatte ? objectMatteCss(enabledMatte, localFrame) : undefined}>{content}{!offline && <TreatmentOverlays clip={clip} localFrame={localFrame} mode={clip.kind === "video" || clip.kind === "image" ? "finishing" : "all"} />}{!offline && effectOverlays}</AbsoluteFill><EffectFailureBadge errors={[...effectPlan.errors, ...(matteMissing ? [`Object matte has no frame: ${enabledMatte.name}`] : [])]} /></AbsoluteFill>;
+};
+
+const NestedAudioScope: React.FC<React.PropsWithChildren<{clip: EditorClip}>> = ({clip, children}) => {
+  const frame = useCurrentFrame();
+  return <AbsoluteFill data-audio-nest-id={clip.id} data-audio-gain={clipAudioVolume(clip, frame)}>{children}</AbsoluteFill>;
 };
 
 const CachedAudioTimeline: React.FC<EditorCompositionProps & {ancestors: string[]}> = ({project, ancestors, useProxies = false}) => {
@@ -346,7 +305,7 @@ const CachedAudioTimeline: React.FC<EditorCompositionProps & {ancestors: string[
     if (clip.kind === "sequence" && clip.nestedSequenceId && !ancestors.includes(clip.nestedSequenceId)) {
       const nested = projectViewForSequence(project, clip.nestedSequenceId);
       if (!nested) return null;
-      return <Sequence key={clip.id} from={clip.start} durationInFrames={clip.duration}><Sequence from={-Math.round(clip.sourceStart)} durationInFrames={nested.durationInFrames}><CachedAudioTimeline project={nested} ancestors={[...ancestors, clip.nestedSequenceId]} useProxies={useProxies} /></Sequence></Sequence>;
+      return <Sequence key={clip.id} from={clip.start} durationInFrames={clip.duration}><NestedAudioScope clip={clip}><Sequence from={-Math.round(clip.sourceStart)} durationInFrames={nested.durationInFrames}><CachedAudioTimeline project={nested} ancestors={[...ancestors, clip.nestedSequenceId]} useProxies={useProxies} /></Sequence></NestedAudioScope></Sequence>;
     }
     if ((clip.kind !== "audio" && clip.kind !== "video") || !clip.src) return null;
     const trackAudible = clip.kind === "audio" ? !track?.muted && (!audioSoloActive || Boolean(track?.solo)) : !track?.muted;
@@ -372,7 +331,8 @@ const EditorTimeline: React.FC<EditorCompositionProps & {ancestors: string[]}> =
   const audioSoloActive = project.tracks.some((track) => track.kind === "audio" && track.solo);
 
   if (ancestors.length === 1 && useRenderCache && usableRenderCache(project)) {
-    return <AbsoluteFill style={{backgroundColor: "#05060a", overflow: "hidden"}} data-render-cache="active"><OffthreadVideo src={resolveMediaSource(project.renderCache!.url!)} volume={0} pauseWhenBuffering={false} style={{width: "100%", height: "100%", objectFit: "cover"}} /><CachedAudioTimeline project={project} ancestors={ancestors} useProxies={useProxies} /><AbsoluteFill style={{pointerEvents: "none", boxShadow: "inset 0 0 160px rgba(0,0,0,.52)", background: "linear-gradient(180deg, rgba(0,0,0,.06), transparent 45%, rgba(0,0,0,.2))"}} /></AbsoluteFill>;
+    // The cache already contains the complete composition; do not grade it again.
+    return <AbsoluteFill style={{backgroundColor: "#05060a", overflow: "hidden"}} data-render-cache="active"><OffthreadVideo src={resolveMediaSource(project.renderCache!.url!)} volume={0} pauseWhenBuffering={false} style={{width: "100%", height: "100%", objectFit: "cover"}} /><CachedAudioTimeline project={project} ancestors={ancestors} useProxies={useProxies} /></AbsoluteFill>;
   }
 
   return (
@@ -385,9 +345,11 @@ const EditorTimeline: React.FC<EditorCompositionProps & {ancestors: string[]}> =
           if (!nested) return null;
           return (
             <Sequence key={clip.id} from={clip.start} durationInFrames={clip.duration} premountFor={Math.min(project.fps, clip.duration)}>
+              <NestedAudioScope clip={clip}>
               <Sequence from={-Math.round(clip.sourceStart)} durationInFrames={nested.durationInFrames}>
                 <EditorTimeline project={nested} ancestors={[...ancestors, clip.nestedSequenceId]} useProxies={useProxies} />
               </Sequence>
+              </NestedAudioScope>
             </Sequence>
           );
         }
@@ -423,7 +385,7 @@ const EditorTimeline: React.FC<EditorCompositionProps & {ancestors: string[]}> =
 
         return (
           <Sequence key={clip.id} from={sequenceFrom} durationInFrames={Math.max(1, sequenceEnd - sequenceFrom)}>
-            <VisualClip clip={clip} frameOffset={frameOffset} audioMultiplier={trackMultiplier} previewSrc={previewSrc} offline={sourceMedia?.offline} mediaName={sourceMedia?.name} incoming={incoming} outgoing={outgoing} />
+            <VisualClip clip={clip} luts={project.luts ?? []} frameOffset={frameOffset} audioMultiplier={trackMultiplier} previewSrc={previewSrc} offline={sourceMedia?.offline} mediaName={sourceMedia?.name} incoming={incoming} outgoing={outgoing} />
           </Sequence>
         );
       })}

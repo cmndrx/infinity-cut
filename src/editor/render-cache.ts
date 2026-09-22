@@ -8,6 +8,7 @@ const stableStringify = (value: unknown): string => {
 
 export const projectRenderFingerprint = (project: EditorProject) => {
   const renderState = {
+    rendererVersion: 5,
     activeSequenceId: project.activeSequenceId,
     width: project.width,
     height: project.height,
@@ -16,6 +17,7 @@ export const projectRenderFingerprint = (project: EditorProject) => {
     tracks: project.tracks,
     clips: project.clips,
     transitions: project.transitions,
+    sequences: project.sequences,
     luts: project.luts,
     audioSettings: project.audioSettings,
     media: project.media.map(({id, src, offline}) => ({id, src, offline})),

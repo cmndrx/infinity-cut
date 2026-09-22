@@ -121,9 +121,12 @@ const sample3d = (data: Float32Array, size: number, red: number, green: number, 
   }) as RgbColor;
 };
 
+const decodedLuts = new WeakMap<ProjectLut, {encoded: string; data: Float32Array}>();
 export const evaluateLut = (lut: ProjectLut, input: RgbColor): RgbColor => {
   const expected = (lut.kind === "1d" ? lut.size : lut.size ** 3) * 3;
-  const data = base64ToFloat32(lut.dataBase64);
+  const cached = decodedLuts.get(lut);
+  const data = cached?.encoded === lut.dataBase64 ? cached.data : base64ToFloat32(lut.dataBase64);
+  if (cached?.data !== data) decodedLuts.set(lut, {encoded: lut.dataBase64, data});
   if (data.length !== expected) throw new Error(`LUT ${lut.name} has an invalid data payload`);
   const normalized = input.map((value, index) => (value - lut.domainMin[index]) / (lut.domainMax[index] - lut.domainMin[index])) as RgbColor;
   if (lut.kind === "1d") return [0, 1, 2].map((channel) => sample1d(data, lut.size, channel, normalized[channel])) as RgbColor;

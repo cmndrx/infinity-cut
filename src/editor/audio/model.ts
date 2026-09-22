@@ -24,6 +24,8 @@ export type AudioClipMix = {
   durationFrames: number;
   sourceStartFrame: number;
   playbackRate: number;
+  preservePitch?: boolean;
+  volumeKeyframes?: {frame: number; value: number; easing: "linear" | "ease-in-out"}[];
   gainDb: number;
   pan: number;
   fadeInFrames: number;
@@ -182,6 +184,8 @@ export const validateAudioMix = (mix: AudioMix): AudioModelValidation => {
       || clip.fadeInFrames + clip.fadeOutFrames > clip.durationFrames || typeof clip.muted !== "boolean") issues.push({path, message: "Clip timing or mix state is invalid"});
     if (clip.audioStreamIndex !== undefined && (!Number.isInteger(clip.audioStreamIndex) || clip.audioStreamIndex < 0)) issues.push({path: `${path}.audioStreamIndex`, message: "Audio stream index must be a non-negative integer"});
     validateProcessors(clip.processors, `${path}.processors`, issues);
+    if (clip.preservePitch !== undefined && typeof clip.preservePitch !== "boolean") issues.push({path, message: "Invalid pitch preservation setting"});
+    if (clip.volumeKeyframes !== undefined && (!Array.isArray(clip.volumeKeyframes) || clip.volumeKeyframes.some((key) => !Number.isFinite(key.frame) || key.frame < 0 || !finiteBetween(key.value, 0, 16) || !["linear", "ease-in-out"].includes(key.easing)))) issues.push({path, message: "Invalid volume automation"});
   });
   return {valid: issues.length === 0, issues};
 };

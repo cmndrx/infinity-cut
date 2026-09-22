@@ -65,6 +65,7 @@ const circularHueDistance = (left: number, right: number) => {
 };
 
 const hueRangeWeight = (hue: number, start: number, end: number, softness: number) => {
+  if (Math.abs(end - start) >= 360) return 1;
   const normalizedHue = ((hue % 360) + 360) % 360;
   const normalizedStart = ((start % 360) + 360) % 360;
   const normalizedEnd = ((end % 360) + 360) % 360;
@@ -146,7 +147,7 @@ export const normalizeColorGrade = (value: Partial<ColorGrade> | null | undefine
         name: typeof secondary.name === "string" && secondary.name.trim() ? secondary.name : `Secondary ${index + 1}`,
         enabled: secondary.enabled !== false,
         hueStart: ((finite(secondary.hueStart, 0) % 360) + 360) % 360,
-        hueEnd: ((finite(secondary.hueEnd, 360) % 360) + 360) % 360,
+        hueEnd: finite(secondary.hueEnd, 360) === 360 ? 360 : ((finite(secondary.hueEnd, 360) % 360) + 360) % 360,
         hueSoftness: clamp(finite(secondary.hueSoftness, 0), 0, 180),
         saturationMin: clamp(finite(secondary.saturationMin, 0)),
         saturationMax: clamp(finite(secondary.saturationMax, 1)),

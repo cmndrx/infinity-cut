@@ -3,7 +3,6 @@ import {mkdir, readdir, rm, stat, unlink} from "node:fs/promises";
 import {randomUUID} from "node:crypto";
 import path from "node:path";
 import {pipeline} from "node:stream/promises";
-import {spawn} from "node:child_process";
 import {bundle} from "@remotion/bundler";
 import {makeCancelSignal, renderFrames, renderMedia, selectComposition, type AudioCodec, type Codec, type PixelFormat} from "@remotion/renderer";
 import type {Connect, Plugin} from "vite";
@@ -12,9 +11,9 @@ import {writeStoredZip} from "./server/zip";
 import {ProxyManager} from "./server/proxy-manager";
 import {MediaAnalysisManager, type AnalysisKind} from "./server/media-analysis-manager";
 import {RenderCacheManager} from "./server/render-cache-manager";
+import {resolveMediaSourcePath, safeMediaFilename} from "./server/media-source";
+import {assertSupportedNestedAudio, createProjectAudioRenderer} from "./server/project-audio-renderer";
 import type {EditorProject} from "./src/editor/types";
-import {buildProjectAudioMix} from "./src/editor/audio/project-audio";
-import {buildFfmpegAudioGraph} from "./src/editor/audio/ffmpeg-filter-graph";
 
 export type RenderFormat = "mp4" | "webm" | "hevc" | "prores" | "png-sequence" | "jpeg-sequence" | "wav" | "audio-stems";
 export type RenderQuality = "draft" | "standard" | "high";
@@ -74,11 +73,7 @@ const readSmallJson = async <T,>(request: import("node:http").IncomingMessage): 
   return JSON.parse(Buffer.concat(chunks).toString("utf8")) as T;
 };
 
-const safeFilename = (value: string) => value
-  .normalize("NFKD")
-  .replace(/[^a-zA-Z0-9._-]+/g, "-")
-  .replace(/^-+|-+$/g, "")
-  .slice(0, 120) || "media-file";
+const safeFilename = safeMediaFilename;
 
 const contentTypeFor = (filename: string) => {
   const extension = path.extname(filename).toLowerCase();
@@ -122,12 +117,7 @@ export const directorsCutProRenderPlugin = (): Plugin => {
     const analysisDir = path.join(dataDir, "analysis");
     const cacheDir = path.join(dataDir, "render-cache");
     const renderDir = path.join(dataDir, "renders");
-    const mediaSourcePath = (src: string) => {
-      const local = src.match(/^\/api\/media\/([a-f0-9-]+)\/([^/?#]+)/i);
-      if (local) return path.join(mediaDir, `${local[1]}-${safeFilename(decodeURIComponent(local[2]))}`);
-      if (/^https?:\/\//i.test(src) || path.isAbsolute(src)) return src;
-      return path.join(root, "public", src.replace(/^\/+/, ""));
-    };
+    const mediaSourcePath = (src: string) => resolveMediaSourcePath(src, root, mediaDir);
     const proxySourcePath = (src: string) => {
       if (src.match(/^\/api\/media\/[a-f0-9-]+\/[^/?#]+$/i)) return mediaSourcePath(src);
       if (/^https?:\/\//i.test(src) || path.isAbsolute(src) && !src.startsWith("/")) throw new Error("Only locally staged media can be proxied");
@@ -156,55 +146,11 @@ export const directorsCutProRenderPlugin = (): Plugin => {
         hardwareAcceleration: "if-possible", logLevel: "warn",
       });
     });
-    const runFfmpeg = (args: string[], signal: AbortSignal) => new Promise<void>((resolve, reject) => {
-      const child = spawn("ffmpeg", args, {stdio: ["ignore", "ignore", "pipe"]});
-      let stderr = "";
-      child.stderr.on("data", (chunk) => { stderr = `${stderr}${String(chunk)}`.slice(-8_000); });
-      const abort = () => child.kill("SIGTERM");
-      signal.addEventListener("abort", abort, {once: true});
-      child.once("error", reject);
-      child.once("exit", (code) => {
-        signal.removeEventListener("abort", abort);
-        if (signal.aborted) reject(new Error("Export cancelled"));
-        else if (code === 0) resolve();
-        else reject(new Error(stderr.trim() || `FFmpeg exited with code ${code}`));
-      });
-    });
-    const hasAudioStream = (source: string, signal: AbortSignal) => new Promise<boolean>((resolve) => {
-      const child = spawn("ffprobe", ["-v", "error", "-select_streams", "a:0", "-show_entries", "stream=index", "-of", "csv=p=0", source], {stdio: ["ignore", "pipe", "ignore"]});
-      let output = "";
-      child.stdout.on("data", (chunk) => { output += String(chunk); });
-      const abort = () => child.kill("SIGTERM");
-      signal.addEventListener("abort", abort, {once: true});
-      child.once("error", () => resolve(false));
-      child.once("exit", () => { signal.removeEventListener("abort", abort); resolve(Boolean(output.trim())); });
-    });
-    const renderProfessionalAudio = async (options: {project: EditorProject; output: string; frameRange: [number, number] | null; signal: AbortSignal; videoInput?: string; audioCodec: "aac" | "libopus" | "pcm_s16le" | "pcm_s24le"}) => {
-      const candidates = options.project.clips.filter((clip) => clip.src && (clip.kind === "audio" || clip.kind === "video"));
-      const checks = await Promise.all(candidates.map(async (clip) => ({clip, audible: await hasAudioStream(mediaSourcePath(clip.src!), options.signal)})));
-      const clips = checks.filter((item) => item.audible).map((item) => item.clip);
-      const firstAudioIndex = options.videoInput ? 1 : 0;
-      const inputIndex = new Map(clips.map((clip, index) => [clip.id, firstAudioIndex + index]));
-      const mix = buildProjectAudioMix(options.project, (clipId) => inputIndex.has(clipId) ? {inputIndex: inputIndex.get(clipId)!} : undefined);
-      const graph = buildFfmpegAudioGraph(mix);
-      const args = ["-hide_banner", "-loglevel", "error", "-y"];
-      if (options.videoInput) args.push("-i", options.videoInput);
-      for (const clip of clips) args.push("-i", mediaSourcePath(clip.src!));
-      args.push("-filter_complex", graph.filterComplex);
-      if (options.videoInput) args.push("-map", "0:v:0", "-c:v", "copy");
-      args.push("-map", `[${graph.outputLabel}]`, "-c:a", options.audioCodec);
-      if (options.audioCodec === "aac") args.push("-b:a", "320k");
-      if (options.audioCodec === "libopus") args.push("-b:a", "256k");
-      if (options.frameRange) {
-        args.push("-ss", String(options.frameRange[0] / options.project.fps));
-        args.push("-t", String((options.frameRange[1] - options.frameRange[0] + 1) / options.project.fps));
-      }
-      args.push(options.output);
-      await runFfmpeg(args, options.signal);
-    };
+    const renderProfessionalAudio = createProjectAudioRenderer(mediaSourcePath);
     const queue = new PersistentExportQueue<RenderRequest>(path.join(dataDir, "render-queue.json"), async (job, controls) => {
       const request = job.request;
       const {project} = request;
+      assertSupportedNestedAudio(project);
       const format: RenderFormat = ["webm", "hevc", "prores", "png-sequence", "jpeg-sequence", "wav", "audio-stems"].includes(request.format ?? "") ? request.format! : "mp4";
       const quality: RenderQuality = ["draft", "standard", "high"].includes(request.quality ?? "") ? request.quality! : "standard";
       const resolution: RenderResolution = request.resolution === "720p" ? "720p" : "source";
