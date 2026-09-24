@@ -35,7 +35,6 @@ import {
   Magnet,
   Maximize2,
   Menu,
-  MessageSquare,
   MousePointer2,
   Palette,
   Pause,
@@ -66,7 +65,7 @@ import {
 } from "lucide-react";
 import {EditorComposition} from "./EditorComposition";
 import {getAnimatedPropertyValue, hasKeyframeAt, hasPropertyKeyframes} from "./animation";
-import {sampleProject} from "./project";
+import {uploadCloudMedia} from "./cloud";
 import type {EditorClip, EditorProject, EditorTrack, EditorTransition, KeyframeProperty, MediaKind, ProjectMedia, TextStyle, TransitionType} from "./types";
 import {DEFAULT_CAPTION_STYLE, DEFAULT_EFFECTS, DEFAULT_TITLE_STYLE, DEFAULT_TRANSFORM} from "./types";
 
@@ -236,44 +235,24 @@ const clipIcon = (kind: MediaKind, size = 13) => {
 const cloneProject = (project: EditorProject): EditorProject => JSON.parse(JSON.stringify(project)) as EditorProject;
 const cloneClip = (clip: EditorClip): EditorClip => JSON.parse(JSON.stringify(clip)) as EditorClip;
 
-const loadInitialProject = (): EditorProject => {
-  try {
-    const saved = localStorage.getItem("infinity-cut-project");
-    if (!saved) return cloneProject(sampleProject);
-    const parsed = JSON.parse(saved) as EditorProject;
-    if (!Array.isArray(parsed.tracks) || !Array.isArray(parsed.clips) || !parsed.fps) return cloneProject(sampleProject);
-    parsed.markers = Array.isArray(parsed.markers) ? parsed.markers : [];
-    parsed.transitions = Array.isArray(parsed.transitions) ? parsed.transitions : [];
-    parsed.mediaBins = Array.isArray(parsed.mediaBins) && parsed.mediaBins.length ? parsed.mediaBins : cloneProject(sampleProject).mediaBins;
-    parsed.media = Array.isArray(parsed.media) ? parsed.media : cloneProject(sampleProject).media;
-    parsed.media = parsed.media.map((item) => ({...item, binId: item.binId ?? parsed.mediaBins[0]?.id ?? "bin-video", offline: item.offline ?? (item.renderReady === false && item.src.startsWith("blob:"))}));
-    if (!parsed.tracks.some((track) => track.kind === "caption")) parsed.tracks.unshift({...C1_TRACK});
-    parsed.tracks = parsed.tracks.map((track) => ({...track, solo: track.solo ?? false, volume: track.volume ?? 1}));
-    parsed.clips = parsed.clips.map((clip) => ({
-      ...clip,
-      fadeIn: clip.fadeIn ?? 0,
-      fadeOut: clip.fadeOut ?? 0,
-      audioMuted: clip.audioMuted ?? false,
-      keyframes: Array.isArray(clip.keyframes) ? clip.keyframes : [],
-      sourceMediaId: clip.sourceMediaId ?? parsed.media.find((item) => item.src === clip.src)?.id,
-      effects: {...DEFAULT_EFFECTS, ...(clip.effects ?? {})},
-      textStyle: clip.kind === "title" ? {...DEFAULT_TITLE_STYLE, ...(clip.textStyle ?? {})} : clip.kind === "caption" ? {...DEFAULT_CAPTION_STYLE, ...(clip.textStyle ?? {})} : clip.textStyle,
-    }));
-    return parsed;
-  } catch {
-    return cloneProject(sampleProject);
-  }
+type EditorProps = {
+ initialProject: EditorProject;
+ onProjectChange: (project: EditorProject) => void;
+ onSave: () => void;
+ onHome: () => void;
+ saveStatus: string;
+ accountName: string;
 };
-
-export const EditorApp: React.FC = () => {
-  const [project, setProject] = useState<EditorProject>(loadInitialProject);
+export const EditorApp: React.FC<EditorProps> = ({initialProject, onProjectChange, onSave, onHome, saveStatus, accountName}) => {
+ const [project, setProject] = useState<EditorProject>(() => cloneProject(initialProject));
+ useEffect(() => onProjectChange(project), [project, onProjectChange]);
   const [past, setPast] = useState<EditorProject[]>([]);
   const [future, setFuture] = useState<EditorProject[]>([]);
-  const [selectedClipIds, setSelectedClipIds] = useState<string[]>(["video-2"]);
+  const [selectedClipIds, setSelectedClipIds] = useState<string[]>([]);
   const [selectedTransitionId, setSelectedTransitionId] = useState<string | null>(null);
   const [activeTool, setActiveTool] = useState<TimelineTool>("select");
   const [linkedSelection, setLinkedSelection] = useState(true);
-  const [frame, setFrame] = useState(105);
+  const [frame, setFrame] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
   const [zoom, setZoom] = useState(1.45);
   const [snap, setSnap] = useState(true);
@@ -296,7 +275,7 @@ export const EditorApp: React.FC = () => {
   const [dragTrackTarget, setDragTrackTarget] = useState<string | null>(null);
   const [scrubbing, setScrubbing] = useState(false);
   const [waveforms, setWaveforms] = useState<Record<string, number[]>>({});
-  const [toast, setToast] = useState("Autosaved just now");
+  const [toast, setToast] = useState("Ready to edit");
   const [exportOpen, setExportOpen] = useState(false);
   const [exportFormat, setExportFormat] = useState<ExportFormat>("mp4");
   const [exportQuality, setExportQuality] = useState<ExportQuality>("standard");
@@ -1388,8 +1367,7 @@ export const EditorApp: React.FC = () => {
   };
 
   const saveProject = () => {
-    localStorage.setItem("infinity-cut-project", JSON.stringify(project));
-    setToast("Project saved locally");
+    onSave();
   };
 
   const exportProjectFile = () => {
@@ -1412,7 +1390,7 @@ export const EditorApp: React.FC = () => {
         progress: 0,
         message: "Re-import media before exporting",
         filename: "",
-        error: `${browserOnlyClips.length} ${browserOnlyClips.length === 1 ? "clip uses" : "clips use"} temporary browser media. Re-import the source file so Infinity Cut can make it available to the renderer.`,
+        error: `${browserOnlyClips.length} ${browserOnlyClips.length === 1 ? "clip uses" : "clips use"} temporary browser media. Re-import the source file so Director Cut PRO can make it available to the renderer.`,
       });
       return;
     }
@@ -1427,6 +1405,7 @@ export const EditorApp: React.FC = () => {
         headers: {"Content-Type": "application/json"},
         body: JSON.stringify({project, format: exportFormat, quality: exportQuality, resolution: exportResolution, frameRange}),
       });
+      if (!response.headers.get("content-type")?.includes("application/json")) throw new Error("Video rendering requires the local Director Cut PRO render service. Open this project in the local app to render MP4/WebM. Project file export is available here.");
       const result = await response.json() as RenderJobStatus & {error?: string};
       if (!response.ok) throw new Error(result.error ?? "The render service rejected the export");
       setRenderJob(result);
@@ -1475,14 +1454,7 @@ export const EditorApp: React.FC = () => {
   const defaultBinForKind = useCallback((kind: ProjectMedia["kind"]) => project.mediaBins.find((bin) => bin.id === `bin-${kind === "image" ? "graphics" : kind}`)?.id ?? project.mediaBins[0]?.id ?? "bin-video", [project.mediaBins]);
 
   const uploadMediaFile = async (file: File) => {
-    try {
-      const upload = await fetch(`/api/media?name=${encodeURIComponent(file.name)}`, {method: "POST", headers: {"Content-Type": file.type || "application/octet-stream"}, body: file});
-      const result = await upload.json() as {url?: string; error?: string};
-      if (!upload.ok || !result.url) throw new Error(result.error ?? "Media upload failed");
-      return {src: new URL(result.url, window.location.origin).href, renderReady: true};
-    } catch {
-      return {src: URL.createObjectURL(file), renderReady: false};
-    }
+    return uploadCloudMedia(file, percent => setToast(`Uploading ${file.name}: ${percent}%`));
   };
 
   const readMediaMetadata = async (src: string, kind: ProjectMedia["kind"]) => {
@@ -1529,6 +1501,7 @@ export const EditorApp: React.FC = () => {
       name: file.name,
       kind,
       src: uploaded.src,
+      storagePath: uploaded.storagePath,
       duration: metadata.duration,
       color: kind === "audio" ? "#42b97e" : kind === "image" ? "#b978e8" : "#578ce8",
       binId: forcedBinId ?? (activeBinId !== "all" ? activeBinId : defaultBinForKind(kind)),
@@ -1562,6 +1535,7 @@ export const EditorApp: React.FC = () => {
   };
 
   const importMedia = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    try {
     const files = Array.from(event.target.files ?? []);
     const {unique, duplicates} = uniqueImportFiles(files);
     const additions = await filesToMediaItems(unique);
@@ -1572,6 +1546,7 @@ export const EditorApp: React.FC = () => {
     const unavailable = additions.filter((item) => item.renderReady === false).length;
     const duplicateMessage = duplicates ? ` · skipped ${duplicates} duplicate${duplicates === 1 ? "" : "s"}` : "";
     setToast(additions.length ? `Imported ${additions.length}${duplicateMessage}${unavailable ? " · preview only" : " · ready to export"}` : `Skipped ${duplicates} duplicate${duplicates === 1 ? "" : "s"}`);
+    } catch (error) {setToast(error instanceof Error ? error.message : "Upload failed. Please retry.");}
     event.target.value = "";
   };
 
@@ -1646,7 +1621,8 @@ export const EditorApp: React.FC = () => {
       setToast(`Choose a ${current.kind} file to ${pending.action} ${current.name}`);
       return;
     }
-    const replacement = await fileToMediaItem(file, 0, current.binId);
+    let replacement: ProjectMedia;
+    try {replacement = await fileToMediaItem(file, 0, current.binId);} catch (error) {setToast(error instanceof Error ? error.message : "Upload failed"); return;}
     commit((draft) => {
       const item = draft.media.find((candidate) => candidate.id === pending.id);
       if (!item) return;
@@ -1679,6 +1655,7 @@ export const EditorApp: React.FC = () => {
   };
 
   const handleTrackDrop = async (event: React.DragEvent<HTMLDivElement>, trackId: string) => {
+    try {
     event.preventDefault();
     event.stopPropagation();
     const start = getDropFrame(event);
@@ -1707,6 +1684,7 @@ export const EditorApp: React.FC = () => {
     }
     const unavailable = additions.filter((item) => item.renderReady === false).length;
     setToast(added ? `Dropped ${added} ${added === 1 ? "clip" : "clips"} onto ${track.name}${duplicates ? ` · skipped ${duplicates} duplicate${duplicates === 1 ? "" : "s"}` : ""}${unavailable ? " · preview only until relinked" : " · ready to export"}` : duplicates ? `Skipped ${duplicates} duplicate${duplicates === 1 ? "" : "s"}` : `Those files are not compatible with ${track.name}`);
+    } catch (error) {setToast(error instanceof Error ? error.message : "Upload failed");}
   };
 
   const exportIsActive = Boolean(renderJob && ["queued", "bundling", "rendering"].includes(renderJob.stage));
@@ -1779,16 +1757,16 @@ export const EditorApp: React.FC = () => {
         </div>
       )}
       <header className="topbar">
-        <div className="brand-lockup"><div className="brand-mark"><Clapperboard size={16} /></div><span>INFINITY <b>CUT</b></span></div>
-        <div className="project-title"><span>{project.name}</span><ChevronDown size={13} /><i>{toast}</i></div>
+        <div className="brand-lockup"><div className="brand-mark"><Clapperboard size={16} /></div><span>DIRECTOR CUT <b>PRO</b></span></div>
+        <div className="project-title"><span>{project.name}</span><i>{saveStatus} ? {toast}</i></div>
         <div className="top-actions">
           <button className="icon-button" onClick={undo} disabled={!past.length} title="Undo (⌘Z)"><Undo2 size={16} /></button>
           <button className="icon-button" onClick={redo} disabled={!future.length} title="Redo (⇧⌘Z)"><Redo2 size={16} /></button>
-          <button className="quiet-button"><MessageSquare size={15} /> Review</button>
+          <button className="quiet-button" onClick={onHome}><FolderOpen size={15} /> Projects</button>
           <button className="quiet-button" onClick={saveProject}><Save size={15} /> Save</button>
           <button className="export-button" onClick={() => {if (!exportIsActive) setRenderJob(null); setExportOpen(true);}}><Download size={15} /> Export</button>
           <button className="icon-button"><CircleHelp size={17} /></button>
-          <button className="avatar">BS</button>
+          <button className="avatar" title={accountName} onClick={onHome}>{accountName.slice(0, 2).toUpperCase()}</button>
         </div>
       </header>
 

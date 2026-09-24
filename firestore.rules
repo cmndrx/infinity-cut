@@ -1,0 +1,146 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+      // Allow open read/write access to testLeaderboards
+    match /testLeaderboards/{docId} {
+      allow read, write: if true;
+    }
+
+    // Helper function to check if user is authenticated
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    // Shopping Cart Derby helpers
+    function isDerbyOwnUser(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isDerbyPartyMember(partyId) {
+      return isSignedIn() &&
+        exists(/databases/$(database)/documents/parties/$(partyId)/members/$(request.auth.uid));
+    }
+
+    function isDerbyAssignedPlayer(matchId) {
+      return isSignedIn() &&
+        get(/databases/$(database)/documents/matches/$(matchId)).data.playerIds.hasAny([request.auth.uid]);
+    }
+
+    // Shopping Cart Derby explicit section
+    // Place this above the broad shared catch-all so it is easy to maintain.
+    // IMPORTANT: because the shared rules below are broader, these Derby rules
+    // do NOT override them for signed-in users.
+    match /users/{userId}/games/shopping-cart-derby {
+      allow read: if isDerbyOwnUser(userId);
+      allow update: if isDerbyOwnUser(userId) &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'selectedCartId',
+          'updatedAt'
+        ]);
+      allow create, delete: if false;
+    }
+
+    match /usernames/{username} {
+      allow read, write: if false;
+    }
+
+    match /parties/{partyId} {
+      allow read: if isDerbyPartyMember(partyId);
+      allow write: if false;
+    }
+
+    match /parties/{partyId}/members/{memberId} {
+      allow read: if isDerbyPartyMember(partyId);
+      allow update: if isSignedIn() &&
+        request.auth.uid == memberId &&
+        isDerbyPartyMember(partyId) &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'ready',
+          'cartId',
+          'presenceState',
+          'updatedAt'
+        ]);
+      allow create, delete: if false;
+    }
+
+    match /partyInvites/{inviteId} {
+      allow read: if isSignedIn() &&
+        (resource.data.toUid == request.auth.uid || resource.data.fromUid == request.auth.uid);
+      allow write: if false;
+    }
+
+    match /matchQueues/public-12 {
+      allow read: if isSignedIn();
+      allow write: if false;
+    }
+
+    match /matchQueues/public-12/tickets/{ticketId} {
+      allow read, write: if false;
+    }
+
+    match /matches/{matchId} {
+      allow read: if isDerbyAssignedPlayer(matchId);
+      allow write: if false;
+    }
+
+    match /matches/{matchId}/socketTickets/{ticketOwnerId} {
+      allow read, write: if false;
+    }
+
+    match /config/shopping-cart-derby {
+      allow read, write: if false;
+    }
+
+    match /{col}/{cardId} {
+      allow read: if col in ["Character cards", "Infinity cards"] || isSignedIn();
+      // allow write, create: if isSignedIn();
+    }
+
+    // Preserve suite behavior outside the DCP namespace.
+    match /{root}/{id}/{rest=**} {
+      allow read, write: if root != 'users' && isSignedIn();
+    }
+    match /users/{uid}/{child}/{rest=**} {
+      allow read, write: if child != 'dcpProjects' && isSignedIn();
+    }
+    // DCP payload is versioned JSON; binary files live in Storage.
+    match /users/{uid}/dcpProjects/{projectId} {
+      function isOwner() { return request.auth != null && request.auth.uid == uid; }
+      function validProject() {
+        let d = request.resource.data;
+        return d.keys().hasOnly(['name', 'payload', 'revision', 'schemaVersion', 'createdAt', 'updatedAt'])
+          && d.name is string && d.name.size() > 0 && d.name.size() <= 120
+          && d.payload is string && d.payload.size() <= 800000
+          && d.schemaVersion == 1 && d.revision is int
+          && d.createdAt is timestamp && d.updatedAt == request.time;
+      }
+      allow read, delete: if isOwner();
+      allow create: if isOwner() && validProject() && request.resource.data.revision == 1 && request.resource.data.createdAt == request.time;
+      allow update: if isOwner() && validProject()
+        && request.resource.data.revision == resource.data.revision + 1
+        && request.resource.data.createdAt == resource.data.createdAt;
+    }
+
+    match /users/{userId} {
+      allow read, write:  if isSignedIn(); //&& request.auth.uid == userId; //if true;
+
+      match /mail/{threadId} {
+        allow read, write: if request.auth != null && request.auth.uid == userId;
+
+        match /messages/{messageId} {
+          allow read, write: if request.auth != null && request.auth.uid == userId;
+        }
+      }
+    }
+
+    match /collections_onboarding/{collectionId} {
+      allow read, write:  if true;
+    }
+
+    //   match /{document=**} {
+    //   allow read, write, create: if true;
+    // }
+  }
+}

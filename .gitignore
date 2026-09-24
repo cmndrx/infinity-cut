@@ -9,3 +9,8 @@ editor-dist/
 # Ignore the output video from Git but not videos you import into src/.
 out
 .gstack/
+
+.firebase/
+firebase-debug.log
+playwright-report/
+test-results/

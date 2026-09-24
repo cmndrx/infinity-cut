@@ -1,0 +1,20 @@
+{
+  "date": "2026-09-22",
+  "scope": "Director Cut PRO namespace only; shared legacy grants outside DCP were preserved, not audited or hardened.",
+  "score": 4,
+  "summary": "DCP authorization uses the Firebase Auth UID in the path. Both create and update validate fields, size and revision. Shared recursive grants exclude DCP. Live browser/SDK checks cover owner lifecycle, foreign-user read/list/update/delete denial, foreign Storage access denial, invalid fields/revisions/MIME denial, and temporary-account cleanup.",
+  "findings": [
+    {
+      "check": "Type safety",
+      "severity": "minor",
+      "issue": "The editor payload is size-limited JSON text. Rules validate the envelope but cannot validate the JSON structure, so an owner using their own API client can corrupt their own project.",
+      "recommendation": "Add a versioned payload parser/migration layer when supporting third-party project imports or future schema versions. No authority or entitlement is taken from the payload."
+    },
+    {
+      "check": "Storage sharing",
+      "severity": "minor",
+      "issue": "Firebase download URLs contain bearer tokens. Rules prevent other accounts from discovering files through the SDK, but a recipient of a deliberately shared download URL can retrieve that file.",
+      "recommendation": "For a future strict-private-media requirement, replace token URLs with an authenticated media delivery service supporting video range requests."
+    }
+  ]
+}

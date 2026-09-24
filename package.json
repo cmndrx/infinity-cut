@@ -41,6 +41,7 @@
     "@remotion/three": "4.0.487",
     "@remotion/transitions": "4.0.487",
     "@remotion/webcodecs": "4.0.487",
+    "firebase": "^12.19.0",
     "lucide-react": "^1.28.0",
     "mediabunny": "1.50.7",
     "react": "19.2.3",
@@ -48,6 +49,7 @@
     "remotion": "4.0.487"
   },
   "devDependencies": {
+    "@playwright/test": "^1.63.0",
     "@remotion/eslint-config-flat": "4.0.487",
     "@types/react": "19.2.7",
     "@types/react-dom": "^19.2.3",
@@ -64,7 +66,8 @@
     "editor:build": "vite build",
     "build": "remotion bundle",
     "upgrade": "remotion upgrade",
-    "lint": "eslint src && tsc"
+    "lint": "eslint src && tsc",
+    "test:accounts": "playwright test"
   },
   "sideEffects": [
     "*.css"

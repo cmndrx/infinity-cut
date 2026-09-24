@@ -243,7 +243,7 @@ export const infinityCutRenderPlugin = (): Plugin => {
         try {
           const body = await readJson(request);
           if (!body.project || !Array.isArray(body.project.clips) || !Array.isArray(body.project.tracks) || body.project.durationInFrames < 1) {
-            return sendJson(response, 400, {error: "Invalid Infinity Cut project"});
+            return sendJson(response, 400, {error: "Invalid Director Cut PRO project"});
           }
           const id = randomUUID();
           const format = body.format === "webm" ? "webm" : "mp4";

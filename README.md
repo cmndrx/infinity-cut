@@ -1,8 +1,12 @@
-# Infinity Cut + Remotion VFX
+# Director Cut PRO
 
-This repository contains a browser-based nonlinear video editor and the existing Remotion trailer compositions.
+Director Cut PRO is an account-based, multi-project video editor in the InfiNFT suite.
 
-## Infinity Cut editor
+Production: https://directorcutpro.web.app
+
+Sign in with an existing InfiNFT account (email/password), create an account, or reset a password. The project dashboard supports creating, reopening, renaming, duplicating, deleting, and searching projects. New projects start empty.
+
+## Director Cut PRO editor
 
 Start the editing workspace:
 
@@ -10,7 +14,7 @@ Start the editing workspace:
 npm run dev
 ```
 
-`npm run editor` is available as an alias. Infinity Cut is a separate application from Remotion Studio; dragging clips onto a Remotion Studio timeline will not add them to an Infinity Cut sequence.
+`npm run editor` is available as an alias. Director Cut PRO is a separate application from Remotion Studio; dragging clips onto a Remotion Studio timeline will not add them to an Director Cut PRO sequence.
 
 The editor opens at `http://localhost:5173/editor.html` and includes:
 
@@ -50,7 +54,7 @@ The editor opens at `http://localhost:5173/editor.html` and includes:
 - Timeline snapping and zoom
 - Undo and redo history
 - Remotion-powered program preview
-- Local project persistence and editable JSON project export
+- Cloud autosave with revision conflict detection and editable JSON project export
 
 Keyboard shortcuts:
 
@@ -87,7 +91,7 @@ The output is written to `editor-dist/`.
 1. Select a clip and place the playhead over it.
 2. Click the diamond beside an Inspector property to create its first keyframe.
 3. Drag the playhead to another point inside the clip.
-4. Change the property value. Infinity Cut creates the next keyframe and animates between the two values.
+4. Change the property value. Director Cut PRO creates the next keyframe and animates between the two values.
 
 Click a diamond on the timeline clip to seek to it. The arrows in the Inspector's Animation row move between keyframes. Click a filled property diamond to remove the keyframe at the current playhead position.
 
@@ -133,7 +137,7 @@ Use **Import SRT / VTT** in the Text tab to create timed C1 caption clips from a
 3. Click **Render video**. The dialog reports bundling, frame rendering, audio mixing, and completion progress.
 4. Click **Download MP4** or **Download WebM** when the render finishes. A running export can be cancelled safely.
 
-Video rendering runs through the local Remotion service included with `npm run dev` or `npm run editor`. Imported media is copied into the ignored `.infinity-cut/media/` workspace so it remains accessible to both the editor preview and renderer. Completed files are staged in `.infinity-cut/renders/` and downloaded through the Export dialog.
+Video rendering runs through the local Remotion service included with `npm run dev` or `npm run editor`. Firebase Hosting serves the account dashboard and editor but does not run this Node renderer. Open the same cloud project locally to render MP4/WebM; JSON project export is available on the hosted app. Imported media lives in Firebase Storage. Completed local renders are staged in `.infinity-cut/renders/`.
 
 ### Manage media
 
@@ -145,71 +149,29 @@ Open the **Project** tab to organize source footage into bins, switch between gr
 - Duplicate file imports are skipped using the source file's name, size, and modified time.
 - Media used by the timeline cannot be removed from the project accidentally; its usage count identifies the clips that must be removed or replaced first.
 
-## Remotion Studio
+## Shared Firebase infrastructure
 
-Start the existing trailer composition workspace separately:
+- Project: `infinft-card-game`; Firestore: `(default)`, Standard / Native, `nam5`.
+- Authentication: existing suite Firebase Auth users and providers. Signing in here does not migrate or rewrite shared profiles or balances. Sessions are persisted per browser origin; using the same account on another suite domain may require signing in again.
+- Projects: `users/{uid}/dcpProjects/{projectId}`. Auto-generated project IDs; versioned JSON payload plus name, revision, schemaVersion, createdAt, updatedAt.
+- Files: `gs://infinft-card-game.firebasestorage.app/DCP/{uid}/{video|audio|img}/{uuid}-{filename}`.
+- Project media stores the file's Storage path and download URL. Duplicated projects reference the same source files. Deleting a project intentionally retains files used by other projects.
+- Autosave waits 1.2 seconds after edits, serializes writes, and uses transactions to reject stale revisions. Failed saves remain visible and prevent normal navigation away. Closing a tab with pending changes prompts the browser's unsaved-changes warning. Cloud saves require a connection; there is no offline save guarantee.
+- JSON payloads have an 800 KB guard below Firestore's document limit. Media uploads are capped at 2 GB each. Upload failures are reported without substituting temporary blob URLs.
+- DCP rules require the authenticated path owner. The shared rules were retrieved live before adding DCP exclusions to broad legacy grants. Existing non-DCP behavior is preserved. Storage download URLs are bearer links: anyone given a token URL can retrieve that file.
 
-```console
-npm run studio
-```
+## Deployment
 
-Render a composition with:
+`npm run editor:build` builds `editor-dist/`. Deploy only this Hosting site:
 
-```console
-npx remotion render
-```
+`npx -y firebase-tools@latest deploy --only hosting --project infinft-card-game`
 
-## Original Remotion starter notes
+The root URL rewrites to `editor.html`. DCP web.app, firebaseapp.com, and localhost are authorized Auth domains. Shared provider settings and all existing authorized domains are preserved.
 
-<p align="center">
-  <a href="https://github.com/remotion-dev/logo">
-    <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="https://github.com/remotion-dev/logo/raw/main/animated-logo-banner-dark.apng">
-      <img alt="Animated Remotion Logo" src="https://github.com/remotion-dev/logo/raw/main/animated-logo-banner-light.gif">
-    </picture>
-  </a>
-</p>
+Rules are shared with other InfiNFT apps. Before another rules deployment, fetch and merge the current live rules to avoid overwriting later changes made by another suite app.
 
-Welcome to your Remotion project!
+## Validation
 
-## Commands
+`npm run lint` checks ESLint and TypeScript. `npx playwright test` requires an explicit `DCP_LIVE_TEST=1` opt-in because it creates two temporary Firebase accounts, checks project lifecycle and access isolation, and deletes their documents, uploaded files, and Auth accounts in cleanup. Start Vite on port 5176 first, or set `DCP_TEST_URL` to the deployment URL. The test uses installed Chrome.
 
-**Install Dependencies**
-
-```console
-npm i
-```
-
-**Start Preview**
-
-```console
-npm run dev
-```
-
-**Render video**
-
-```console
-npx remotion render
-```
-
-**Upgrade Remotion**
-
-```console
-npx remotion upgrade
-```
-
-## Docs
-
-Get started with Remotion by reading the [fundamentals page](https://www.remotion.dev/docs/the-fundamentals).
-
-## Help
-
-We provide help on our [Discord server](https://discord.gg/6VzzNDwUwV).
-
-## Issues
-
-Found an issue with Remotion? [File an issue here](https://github.com/remotion-dev/remotion/issues/new).
-
-## License
-
-Note that for some entities a company license is needed. [Read the terms here](https://github.com/remotion-dev/remotion/blob/main/LICENSE.md).
+Demo footage, audio, graphics, and trailer compositions have been removed from this project. The Remotion root retains only the real editor export composition. No legacy browser-local demo project is loaded into an account.

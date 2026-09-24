@@ -136,6 +136,7 @@ export type ProjectMedia = {
   duration: number;
   color: string;
   binId: string;
+  storagePath?: string;
   fileName?: string;
   fileSize?: number;
   mimeType?: string;
