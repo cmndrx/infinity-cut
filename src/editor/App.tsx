@@ -1,8 +1,27 @@
 /* eslint-disable @remotion/non-pure-animation, @remotion/warn-native-media-tag -- Editor UI state and native source monitor media are interactive and are not rendered as a Remotion composition. */
-import React, {useCallback, useEffect, useMemo, useRef, useState} from "react";
+import React, {useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState} from "react";
 import {Player, type PlayerRef} from "@remotion/player";
 import {
   AlignCenter,
+  ArrowUpFromLine,
+  BetweenVerticalStart,
+  BookmarkPlus,
+  ChevronsLeftRight,
+  CircleCheck,
+  Aperture,
+  Crosshair,
+  Droplets,
+  FastForward,
+  FoldHorizontal,
+  Headphones,
+  ListMinus,
+  MonitorPlay,
+  MoveHorizontal,
+  Rewind,
+  Shapes,
+  Square,
+  Sun,
+  TriangleAlert,
   AlignLeft,
   AlignRight,
   AudioWaveform,
@@ -83,7 +102,7 @@ import {createVisualEffectInstance, getVisualEffectDescriptor, listVisualEffects
 import {importObjectMatteSequence} from "./mattes/object-matte";
 import {resolveMediaPreviewSource, type ProxyApiStatus} from "./proxy";
 import {waveformForClip, type MediaAnalysisApiStatus} from "./media-analysis";
-import {frameRangeIntersects, timelineFrameWindow, visibleRulerSeconds} from "./timeline-virtualization";
+import {clampZoom, frameRangeIntersects, MAX_PIXELS_PER_FRAME, MIN_PIXELS_PER_FRAME, sliderToZoom, timelineFrameWindow, timelineRulerTicks, zoomToSlider} from "./timeline-virtualization";
 import {projectRenderFingerprint, usableRenderCache} from "./render-cache";
 
 type MediaItem = ProjectMedia;
@@ -319,7 +338,7 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
   const [shuttleRate, setShuttleRate] = useState(0);
   const [frame, setFrame] = useState(105);
   const [isPlaying, setIsPlaying] = useState(false);
-  const [zoom, setZoom] = useState(1.45);
+  const [pixelsPerFrame, setPixelsPerFrame] = useState(2);
   const [snap, setSnap] = useState(true);
   const [search, setSearch] = useState("");
   const [activeLeftTab, setActiveLeftTab] = useState<"project" | "color" | "effects" | "text" | "audio">("project");
@@ -569,10 +588,14 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
     setTargetedTrackIds((current) => current.filter((id) => project.tracks.some((track) => track.id === id)));
   }, [project.tracks]);
 
-  const pixelsPerFrame = zoom * 1.35;
-  const timelineWidth = Math.max(940, project.durationInFrames * pixelsPerFrame + 120);
+  const fitZoom = Math.max(MIN_PIXELS_PER_FRAME, (timelineViewport.width - 56) / Math.max(1, project.durationInFrames));
+  const minZoom = Math.max(MIN_PIXELS_PER_FRAME, Math.min(fitZoom * 0.4, 1));
+  const sequenceWidth = project.durationInFrames * pixelsPerFrame;
+  const timelineWidth = Math.ceil(Math.max(timelineViewport.width, sequenceWidth + Math.max(160, timelineViewport.width * 0.25)));
+  const timelineLastFrame = Math.ceil(timelineWidth / pixelsPerFrame);
   const virtualTimelineWindow = useMemo(() => timelineFrameWindow(timelineViewport, pixelsPerFrame, project.durationInFrames), [pixelsPerFrame, project.durationInFrames, timelineViewport]);
-  const virtualRulerSeconds = useMemo(() => visibleRulerSeconds(virtualTimelineWindow, project.fps, project.durationInFrames), [project.durationInFrames, project.fps, virtualTimelineWindow]);
+  const rulerTicks = useMemo(() => timelineRulerTicks(timelineFrameWindow(timelineViewport, pixelsPerFrame, timelineLastFrame), project.fps, pixelsPerFrame, timelineLastFrame), [pixelsPerFrame, project.fps, timelineLastFrame, timelineViewport]);
+  const zoomSliderPosition = zoomToSlider(pixelsPerFrame, minZoom, MAX_PIXELS_PER_FRAME);
   const virtualClipsByTrack = useMemo(() => project.clips.reduce<Record<string, EditorClip[]>>((tracks, clip) => {
     if (!frameRangeIntersects(clip.start, clip.duration, virtualTimelineWindow)) return tracks;
     (tracks[clip.trackId] ??= []).push(clip);
@@ -617,6 +640,60 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
       scroller.removeEventListener("scroll", measure);
       observer.disconnect();
     };
+  }, []);
+
+  // Zooming keeps one frame pinned on screen: the cursor for wheel zoom, otherwise
+  // the playhead when it is visible, otherwise the centre of the viewport.
+  const zoomAnchorRef = useRef<{frame: number; offset: number} | null>(null);
+  const zoomTimeline = useCallback((next: number, anchorClientX?: number) => {
+    const clamped = clampZoom(next, minZoom, MAX_PIXELS_PER_FRAME);
+    if (Math.abs(clamped - pixelsPerFrame) < 1e-6) return;
+    const scroller = timelineScrollerRef.current;
+    if (scroller) {
+      const playheadOffset = frame * pixelsPerFrame - scroller.scrollLeft;
+      const offset = anchorClientX !== undefined
+        ? anchorClientX - scroller.getBoundingClientRect().left
+        : playheadOffset >= 0 && playheadOffset <= scroller.clientWidth ? playheadOffset : scroller.clientWidth / 2;
+      zoomAnchorRef.current = {frame: (scroller.scrollLeft + offset) / pixelsPerFrame, offset};
+    }
+    setPixelsPerFrame(clamped);
+  }, [frame, minZoom, pixelsPerFrame]);
+  const zoomTimelineToFit = useCallback(() => {
+    zoomAnchorRef.current = {frame: 0, offset: 0};
+    setPixelsPerFrame(clampZoom(fitZoom, minZoom, MAX_PIXELS_PER_FRAME));
+  }, [fitZoom, minZoom]);
+
+  useLayoutEffect(() => {
+    const anchor = zoomAnchorRef.current;
+    const scroller = timelineScrollerRef.current;
+    if (!anchor || !scroller) return;
+    zoomAnchorRef.current = null;
+    scroller.scrollLeft = Math.max(0, anchor.frame * pixelsPerFrame - anchor.offset);
+  }, [pixelsPerFrame]);
+
+  useEffect(() => {
+    if (pixelsPerFrame < minZoom) setPixelsPerFrame(minZoom);
+  }, [minZoom, pixelsPerFrame]);
+
+  const zoomTimelineRef = useRef(zoomTimeline);
+  zoomTimelineRef.current = zoomTimeline;
+  const pixelsPerFrameRef = useRef(pixelsPerFrame);
+  pixelsPerFrameRef.current = pixelsPerFrame;
+  useEffect(() => {
+    const scroller = timelineScrollerRef.current;
+    if (!scroller) return;
+    const wheel = (event: WheelEvent) => {
+      if (event.ctrlKey || event.metaKey || event.altKey) {
+        event.preventDefault();
+        const delta = event.deltaMode === 1 ? event.deltaY * 16 : event.deltaY;
+        zoomTimelineRef.current(pixelsPerFrameRef.current * Math.exp(-delta * 0.0025), event.clientX);
+      } else if (event.shiftKey && Math.abs(event.deltaX) < 1) {
+        event.preventDefault();
+        scroller.scrollLeft += event.deltaY;
+      }
+    };
+    scroller.addEventListener("wheel", wheel, {passive: false});
+    return () => scroller.removeEventListener("wheel", wheel);
   }, []);
 
   const commit = useCallback((updater: (draft: EditorProject) => void, message?: string) => {
@@ -1185,6 +1262,15 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
         setActiveTool("slip");
       } else if (event.key.toLowerCase() === "u") {
         setActiveTool("slide");
+      } else if (!command && (event.key === "=" || event.key === "+")) {
+        event.preventDefault();
+        zoomTimeline(pixelsPerFrame * 1.5);
+      } else if (!command && (event.key === "-" || event.key === "_")) {
+        event.preventDefault();
+        zoomTimeline(pixelsPerFrame / 1.5);
+      } else if (event.key === "\\") {
+        event.preventDefault();
+        zoomTimelineToFit();
       } else if (event.key === "ArrowLeft") {
         event.preventDefault();
         seek(frame - (event.shiftKey ? project.fps : 1));
@@ -1195,7 +1281,7 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
     };
     window.addEventListener("keydown", keydown);
     return () => window.removeEventListener("keydown", keydown);
-  }, [addMarker, changeShuttleRate, copySelected, deleteSelected, deleteSelectedTransition, duplicateSelected, frame, monitorMode, openSpeedDialog, pasteClips, project.fps, redo, rippleDeleteSelected, seek, selectedTransitionId, splitSelected, togglePlayback, undo]);
+  }, [addMarker, changeShuttleRate, copySelected, deleteSelected, deleteSelectedTransition, duplicateSelected, frame, monitorMode, openSpeedDialog, pasteClips, pixelsPerFrame, project.fps, redo, rippleDeleteSelected, seek, selectedTransitionId, splitSelected, togglePlayback, undo, zoomTimeline, zoomTimelineToFit]);
 
   useEffect(() => {
     const isFileDrag = (event: DragEvent) => Array.from(event.dataTransfer?.types ?? []).includes("Files");
@@ -2930,7 +3016,7 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
           <button className="quiet-button" onClick={() => setReviewOpen(true)}><MessageSquare size={15} /> Review{reviewComments.some((item) => item.status === "open") ? <i className="review-count">{reviewComments.filter((item) => item.status === "open").length}</i> : null}</button>
           <button className="quiet-button" onClick={saveProject}><Save size={15} /> Save</button>
           <button className="export-button" onClick={() => {if (!exportIsActive) setRenderJob(null); setExportOpen(true);}}><Download size={15} /> Export</button>
-          <button className="icon-button"><CircleHelp size={17} /></button>
+          <button className="icon-button" title="Help & keyboard shortcuts" aria-label="Help"><CircleHelp size={17} /></button>
           <button className="avatar">BS</button>
         </div>
       </header>
@@ -2999,8 +3085,8 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
                     <div className="media-thumb" style={{"--media-color": item.color} as React.CSSProperties}>
                       {item.analysis?.status === "ready" && item.analysis.thumbnailUrl && !item.offline ? <img src={item.analysis.thumbnailUrl} alt="" /> : item.kind === "image" && !item.offline ? <img src={item.src} alt="" /> : clipIcon(item.kind, mediaView === "grid" ? 25 : 15)}
                       {item.offline && <b>OFFLINE</b>}
-                      {item.proxy && <i className={`media-proxy-badge ${item.proxy.status}`}>{item.proxy.status === "ready" ? "P" : item.proxy.status === "error" ? "!" : "…"}</i>}
-                      {item.analysis && <i className={`media-analysis-badge ${item.analysis.status}`}>{item.analysis.status === "ready" ? "✓" : item.analysis.status === "error" ? "!" : "…"}</i>}
+                      {item.proxy && <i className={`media-proxy-badge ${item.proxy.status}`}>{item.proxy.status === "ready" ? "P" : item.proxy.status === "error" ? <TriangleAlert size={9} /> : <LoaderCircle className="spinning" size={9} />}</i>}
+                      {item.analysis && <i className={`media-analysis-badge ${item.analysis.status}`}>{item.analysis.status === "ready" ? <CircleCheck size={10} /> : item.analysis.status === "error" ? <TriangleAlert size={9} /> : <LoaderCircle className="spinning" size={9} />}</i>}
                       <span>{formatTimecode(item.duration, project.fps).slice(3)}</span>
                     </div>
                     <div className="media-item-copy"><strong>{item.name}</strong><small>{item.kind.toUpperCase()}{mediaUseCounts[item.id] ? ` · ${mediaUseCounts[item.id]} USE${mediaUseCounts[item.id] === 1 ? "" : "S"}` : ""}</small></div>
@@ -3111,7 +3197,7 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
                   ] as const).map((effect) => <div className={`effect-stack-item ${!selectedEffects[effect.key] ? "disabled" : ""}`} key={effect.name}>
                     <button onClick={() => updateSelectedEffects({[effect.key]: !selectedEffects[effect.key]} as Partial<EditorClip["effects"]>)}>{selectedEffects[effect.key] ? <Eye size={11} /> : <EyeOff size={11} />}</button>
                     <span><strong>{effect.name}</strong><small>{Math.round(effect.value * 10) / 10}{effect.suffix}</small></span>
-                    <input aria-label={effect.name} type="range" min={0} max={effect.max} step={effect.amount === "blur" ? .5 : 1} value={effect.value} onChange={(event) => updateSelected("effects", effect.amount, Number(event.target.value))} />
+                    <input aria-label={effect.name} type="range" min={0} max={effect.max} step={effect.amount === "blur" ? .5 : 1} value={effect.value} style={rangeFill(effect.value, 0, effect.max)} onChange={(event) => updateSelected("effects", effect.amount, Number(event.target.value))} />
                     <button onClick={() => updateSelectedEffects({[effect.amount]: 0} as Partial<EditorClip["effects"]>)} title={`Remove ${effect.name}`}><X size={11} /></button>
                   </div>)}
                 </section>
@@ -3119,7 +3205,7 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
             </div>
           ) : activeLeftTab === "text" ? (
             <div className="text-workspace">
-              <div className="text-heading"><span>Text and captions</span><small>Titles · subtitles · graphics</small></div>
+              <div className="text-heading"><span>Text and captions</span><small>Titles · subtitles</small></div>
               <div className="text-actions">
                 <button className="primary" onClick={() => addTextClip("title")}><Type size={17} /><span><strong>Add title</strong><small>Creates a title at the playhead</small></span><Plus size={14} /></button>
                 <button onClick={() => addTextClip("caption")}><Captions size={17} /><span><strong>Add caption</strong><small>Creates a caption on C1</small></span><Plus size={14} /></button>
@@ -3140,7 +3226,7 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
             </div>
           ) : activeLeftTab === "effects" ? (
             <div className="effects-list">
-              <div className="search-row"><Search size={14} /><input aria-label="Search visual effects" value={effectsSearch} onChange={(event) => setEffectsSearch(event.target.value)} placeholder="Search 25 effects" /></div>
+              <div className="search-row"><Search size={14} /><input aria-label="Search visual effects" value={effectsSearch} onChange={(event) => setEffectsSearch(event.target.value)} placeholder={`Search ${listVisualEffects().length} effects`} /></div>
               {selectedClip && selectedClip.kind !== "audio" && selectedClip.kind !== "caption" && (selectedClip.visualEffects?.length ?? 0) > 0 ? <div className="visual-effect-stack">
                 <div className="effects-heading">Applied effects · render order</div>
                 {selectedClip.visualEffects?.map((effect) => {
@@ -3162,11 +3248,11 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
                 {selectedClip.objectMattes?.map((matte) => <article key={matte.id}><label><input type="checkbox" checked={matte.enabled} onChange={(event) => commit((draft) => {const clip = draft.clips.find((item) => item.id === selectedClip.id); const target = clip?.objectMattes?.find((item) => item.id === matte.id); if (target) target.enabled = event.target.checked;}, "Toggled object matte")} /><span>{matte.name}</span></label><small>{matte.frames.length} frames · {matte.source}</small></article>)}
               </div> : null}
               <div className="effects-heading">Video effects</div>
-              {listVisualEffects(effectsSearch).map((effect) => <button key={effect.id} onClick={() => applyVideoEffect(effect.id)}><Sparkles size={16} /><span>{effect.name}<small>{effect.category} · deterministic preview</small></span><Plus size={14} /></button>)}
+              {listVisualEffects(effectsSearch).map((effect) => <button key={effect.id} className={`effect-row ${effect.category}`} onClick={() => applyVideoEffect(effect.id)}><span className="effect-row-icon">{effectCategoryIcon(effect.category)}</span><span>{effect.name}<small>{effect.category} · deterministic preview</small></span><Plus size={14} /></button>)}
               <div className="effects-heading">Video transitions</div>
               {(Object.entries(TRANSITION_NAMES) as Array<[TransitionType, string]>).map(([type, name]) => (
                 <button key={type} onClick={() => addTransition(type)} title={`Apply ${name} to the selected edit point`}>
-                  <Layers3 size={16} /><span>{name}<small>Transition</small></span><Plus size={14} />
+                  <span className="effect-row-icon transition"><Layers3 size={14} /></span><span>{name}<small>Transition</small></span><Plus size={14} />
                 </button>
               ))}
             </div>
@@ -3186,8 +3272,8 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
         <section className="program-panel panel">
           <div className="monitor-heading">
             <div className="monitor-tabs">
-              <button className={monitorMode === "source" ? "active" : ""} disabled={!selectedMedia} onClick={() => selectedMedia && setMonitorMode("source")}>Source{selectedMedia ? `: ${selectedMedia.name}` : ""}</button>
-              <button className={monitorMode === "program" ? "active" : ""} onClick={() => setMonitorMode("program")}>Program: {activeSequence?.name ?? "Sequence"}</button>
+              <button className={monitorMode === "source" ? "active" : ""} disabled={!selectedMedia} onClick={() => selectedMedia && setMonitorMode("source")}><Film size={13} />Source{selectedMedia ? `: ${selectedMedia.name}` : ""}</button>
+              <button className={monitorMode === "program" ? "active" : ""} onClick={() => setMonitorMode("program")}><MonitorPlay size={13} />Program: {activeSequence?.name ?? "Sequence"}</button>
             </div>
             <div><button
               className={`cache-preview-toggle ${renderCacheUsable && useRenderCache ? "active" : ""} ${renderCacheWorking ? "working" : ""}`}
@@ -3294,12 +3380,12 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
             <div className="source-controls">
               <span className="timecode primary">{formatTimecode(sourceFrame, project.fps)}</span>
               <button onClick={() => setSourcePoint("inFrame")} title="Mark In (I)">Mark In <kbd>I</kbd></button>
-              <button onClick={() => seekSource(sourceFrame - 1)}><ChevronRight className="flip" size={15} /></button>
-              <button className={shuttleRate < 0 ? "shuttle active" : "shuttle"} onClick={() => changeShuttleRate(-1)} title="Play backward (J)">J</button>
+              <button onClick={() => seekSource(sourceFrame - 1)} title="Previous frame" aria-label="Previous frame"><ChevronLeft size={15} /></button>
+              <button className={shuttleRate < 0 ? "shuttle active" : "shuttle"} onClick={() => changeShuttleRate(-1)} title="Play backward (J)" aria-label="Play backward"><Rewind size={14} fill="currentColor" /></button>
               <button className="play-button" onClick={() => {if (selectedMedia.kind === "image") return; if (sourceMediaRef.current?.paused) void sourceMediaRef.current.play(); else sourceMediaRef.current?.pause();}}>{sourcePlaying ? <Pause size={16} fill="currentColor" /> : <Play size={16} fill="currentColor" />}</button>
-              <button className={shuttleRate === 0 ? "shuttle stop" : "shuttle"} onClick={() => changeShuttleRate(0)} title="Stop shuttle (K)">K</button>
-              <button className={shuttleRate > 0 ? "shuttle active" : "shuttle"} onClick={() => changeShuttleRate(1)} title="Play forward (L)">L</button>
-              <button onClick={() => seekSource(sourceFrame + 1)}><ChevronRight size={15} /></button>
+              <button className={shuttleRate === 0 ? "shuttle stop" : "shuttle"} onClick={() => changeShuttleRate(0)} title="Stop shuttle (K)" aria-label="Stop shuttle"><Square size={11} fill="currentColor" /></button>
+              <button className={shuttleRate > 0 ? "shuttle active" : "shuttle"} onClick={() => changeShuttleRate(1)} title="Play forward (L)" aria-label="Play forward"><FastForward size={14} fill="currentColor" /></button>
+              <button onClick={() => seekSource(sourceFrame + 1)} title="Next frame" aria-label="Next frame"><ChevronRight size={15} /></button>
               <button onClick={() => setSourcePoint("outFrame")} title="Mark Out (O)">Mark Out <kbd>O</kbd></button>
               <button className="source-edit insert" onClick={() => performThreePointEdit("insert")} title="Insert edit (,)">Insert <kbd>,</kbd></button>
               <button className="source-edit overwrite" onClick={() => performThreePointEdit("overwrite")} title="Overwrite edit (.)">Overwrite <kbd>.</kbd></button>
@@ -3308,29 +3394,29 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
           </div> : <div className="transport">
             <div className="timecode primary">{formatTimecode(frame, project.fps)}</div>
             <div className="transport-controls">
-              <button onClick={() => seek(frame - project.fps)} title="Previous second"><StepBack size={16} /></button>
-              <button onClick={() => seek(frame - 1)} title="Previous frame"><ChevronRight className="flip" size={17} /></button>
-              <button className={shuttleRate < 0 ? "shuttle active" : "shuttle"} onClick={() => changeShuttleRate(-1)} title="Play backward (J)">J</button>
+              <button onClick={() => seek(frame - project.fps)} title="Back one second (⇧←)" aria-label="Back one second"><StepBack size={16} /></button>
+              <button onClick={() => seek(frame - 1)} title="Previous frame (←)" aria-label="Previous frame"><ChevronLeft size={17} /></button>
+              <button className={shuttleRate < 0 ? "shuttle active" : "shuttle"} onClick={() => changeShuttleRate(-1)} title="Play backward (J)" aria-label="Play backward"><Rewind size={14} fill="currentColor" /></button>
               <button className="play-button" onClick={togglePlayback} aria-label={isPlaying ? "Pause" : "Play"} title="Play or pause (Space)">{isPlaying ? <Pause size={17} fill="currentColor" /> : <Play size={17} fill="currentColor" />}</button>
-              <button className={shuttleRate === 0 ? "shuttle stop" : "shuttle"} onClick={() => changeShuttleRate(0)} title="Stop shuttle (K)">K</button>
-              <button className={shuttleRate > 0 ? "shuttle active" : "shuttle"} onClick={() => changeShuttleRate(1)} title="Play forward (L)">L</button>
-              <button onClick={() => seek(frame + 1)} title="Next frame"><ChevronRight size={17} /></button>
-              <button onClick={() => seek(frame + project.fps)} title="Next second"><StepForward size={16} /></button>
-              {shuttleRate !== 0 && <span className="shuttle-rate">{shuttleRate > 0 ? "▶" : "◀"} {Math.abs(shuttleRate)}×</span>}
+              <button className={shuttleRate === 0 ? "shuttle stop" : "shuttle"} onClick={() => changeShuttleRate(0)} title="Stop shuttle (K)" aria-label="Stop shuttle"><Square size={11} fill="currentColor" /></button>
+              <button className={shuttleRate > 0 ? "shuttle active" : "shuttle"} onClick={() => changeShuttleRate(1)} title="Play forward (L)" aria-label="Play forward"><FastForward size={14} fill="currentColor" /></button>
+              <button onClick={() => seek(frame + 1)} title="Next frame (→)" aria-label="Next frame"><ChevronRight size={17} /></button>
+              <button onClick={() => seek(frame + project.fps)} title="Forward one second (⇧→)" aria-label="Forward one second"><StepForward size={16} /></button>
+              {shuttleRate !== 0 && <span className="shuttle-rate">{shuttleRate > 0 ? <FastForward size={11} fill="currentColor" /> : <Rewind size={11} fill="currentColor" />}{Math.abs(shuttleRate)}×</span>}
             </div>
             <div className="transport-range-controls" role="group" aria-label="Timeline range editing">
               <button className={timelineRange ? "marked" : ""} onClick={() => setTimelinePoint("inFrame")} title="Mark timeline In (I)">In</button>
               <button className={timelineRange ? "marked" : ""} onClick={() => setTimelinePoint("outFrame")} title="Mark timeline Out (O)">Out</button>
-              <button disabled={!timelineRange} onClick={() => performRangeEdit("lift")} title="Lift marked range and leave a gap (;)">Lift</button>
-              <button disabled={!timelineRange} onClick={() => performRangeEdit("extract")} title="Extract marked range and close the gap (')">Extract</button>
-              <button disabled={!timelineRange} onClick={() => setTimelineRange(null)} title="Clear timeline In and Out">×</button>
+              <button disabled={!timelineRange} onClick={() => performRangeEdit("lift")} title="Lift marked range and leave a gap (;)"><ArrowUpFromLine size={12} /> Lift</button>
+              <button disabled={!timelineRange} onClick={() => performRangeEdit("extract")} title="Extract marked range and close the gap (')"><ListMinus size={12} /> Extract</button>
+              <button disabled={!timelineRange} onClick={() => setTimelineRange(null)} title="Clear timeline In and Out" aria-label="Clear In and Out"><X size={12} /></button>
               <span className="timecode">{formatTimecode(project.durationInFrames, project.fps)}</span>
             </div>
           </div>}
         </section>
 
         <aside className="inspector-panel panel">
-          <div className="panel-heading"><span>Inspector</span><button><Menu size={15} /></button></div>
+          <div className="panel-heading"><span><SlidersHorizontal size={12} /> Inspector</span><button title="Inspector options" aria-label="Inspector options"><Menu size={15} /></button></div>
           {selectedTransition ? (
             <div className="inspector-content transition-inspector">
               <div className="selected-summary"><span className="transition-summary-icon"><Layers3 size={15} /></span><div><strong>{TRANSITION_NAMES[selectedTransition.type]}</strong><small>{selectedTransitionFrom?.name} → {selectedTransitionTo?.name}</small></div></div>
@@ -3365,7 +3451,7 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
                     <label><span>Background</span><input aria-label="Background color" type="color" value={selectedTextStyle.backgroundColor} onChange={(event) => updateSelectedText({textStyle: {backgroundColor: event.target.value}})} /><b>{selectedTextStyle.backgroundColor}</b></label>
                     <label><span>Outline</span><input aria-label="Outline color" type="color" value={selectedTextStyle.strokeColor} onChange={(event) => updateSelectedText({textStyle: {strokeColor: event.target.value}})} /><b>{selectedTextStyle.strokeColor}</b></label>
                   </div>
-                  <label className="plain-slider-property"><span>Background opacity <b>{Math.round(selectedTextStyle.backgroundOpacity)}%</b></span><input aria-label="Background opacity" type="range" min={0} max={100} value={selectedTextStyle.backgroundOpacity} onChange={(event) => updateSelectedText({textStyle: {backgroundOpacity: Number(event.target.value)}})} /></label>
+                  <label className="plain-slider-property"><span>Background opacity <b>{Math.round(selectedTextStyle.backgroundOpacity)}%</b></span><input aria-label="Background opacity" type="range" min={0} max={100} value={selectedTextStyle.backgroundOpacity} style={rangeFill(selectedTextStyle.backgroundOpacity, 0, 100)} onChange={(event) => updateSelectedText({textStyle: {backgroundOpacity: Number(event.target.value)}})} /></label>
                 </InspectorSection>
               )}
               <div className="animation-strip">
@@ -3429,12 +3515,14 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
             <div className="tool-group">
               <button className={activeTool === "select" ? "active" : ""} onClick={() => setActiveTool("select")} title="Selection and marquee tool (V)"><MousePointer2 size={15} /></button>
               <button className={activeTool === "razor" ? "active" : ""} onClick={() => setActiveTool("razor")} title="Razor tool (C)"><Scissors size={15} /></button>
-              <button className={activeTool === "ripple" ? "active" : ""} onClick={() => setActiveTool("ripple")} title="Ripple edit tool (B)"><span className="tool-letter">R</span></button>
-              <button className={activeTool === "roll" ? "active" : ""} onClick={() => setActiveTool("roll")} title="Rolling edit tool (N)"><span className="tool-letter">O</span></button>
-              <button className={activeTool === "slip" ? "active" : ""} onClick={() => setActiveTool("slip")} title="Slip tool (Y)"><span className="tool-letter">Y</span></button>
-              <button className={activeTool === "slide" ? "active" : ""} onClick={() => setActiveTool("slide")} title="Slide tool (U)"><span className="tool-letter">U</span></button>
-              <button onClick={addMarker} title="Add marker at playhead (M)"><Plus size={15} /></button>
+              <button className={activeTool === "ripple" ? "active" : ""} onClick={() => setActiveTool("ripple")} title="Ripple edit tool (B)"><BetweenVerticalStart size={15} /></button>
+              <button className={activeTool === "roll" ? "active" : ""} onClick={() => setActiveTool("roll")} title="Rolling edit tool (N)"><FoldHorizontal size={15} /></button>
+              <button className={activeTool === "slip" ? "active" : ""} onClick={() => setActiveTool("slip")} title="Slip tool (Y)"><ChevronsLeftRight size={15} /></button>
+              <button className={activeTool === "slide" ? "active" : ""} onClick={() => setActiveTool("slide")} title="Slide tool (U)"><MoveHorizontal size={15} /></button>
+              <span className="tool-divider" aria-hidden="true" />
+              <button onClick={addMarker} title="Add marker at playhead (M)"><BookmarkPlus size={15} /></button>
               <button onClick={rippleDeleteSelected} title="Ripple delete selected (Shift+Delete)"><Trash2 size={15} /></button>
+              <span className="tool-divider" aria-hidden="true" />
               <button className={snap ? "active" : ""} onClick={() => setSnap((value) => !value)} title="Snap to clips, markers, and playhead"><Magnet size={15} /></button>
               <button className={linkedSelection ? "active" : ""} onClick={() => setLinkedSelection((value) => !value)} title="Linked selection"><Link2 size={15} /></button>
               <span className="tool-divider" aria-hidden="true" />
@@ -3453,26 +3541,33 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
               </select>
               <span>{selectedClipIds.length ? `${selectedClipIds.length} selected` : `${project.width} × ${project.height} · ${formatFrameRate(project.fps)} fps`}</span>
             </div>
-            <div className="zoom-control"><ZoomOut size={14} /><input type="range" min="0.55" max="3.4" step="0.05" value={zoom} onChange={(event) => setZoom(Number(event.target.value))} /><ZoomIn size={14} /></div>
+            <div className="zoom-control" role="group" aria-label="Timeline zoom">
+              <button onClick={() => zoomTimeline(pixelsPerFrame / 1.5)} title="Zoom out (-)" aria-label="Zoom out"><ZoomOut size={14} /></button>
+              <input aria-label="Timeline zoom level" type="range" min="0" max="1" step="0.001" value={zoomSliderPosition} style={{"--fill": `${zoomSliderPosition * 100}%`} as React.CSSProperties} onChange={(event) => zoomTimeline(sliderToZoom(Number(event.target.value), minZoom, MAX_PIXELS_PER_FRAME))} />
+              <button onClick={() => zoomTimeline(pixelsPerFrame * 1.5)} title="Zoom in (=)" aria-label="Zoom in"><ZoomIn size={14} /></button>
+              <button className="zoom-fit" onClick={zoomTimelineToFit} title="Zoom to fit sequence (\\)" aria-label="Zoom to fit"><Maximize2 size={13} /></button>
+            </div>
           </div>
           <div className="timeline-body">
             <div className="track-headers">
-              <div className="track-routing-header" title="Source patch and edit targets"><span>Patch</span><span>Target</span></div>
+              <div className="track-routing-header" title="Source patch and edit targets"><span>Patch</span><span><Crosshair size={10} /></span><span>Tracks</span></div>
               {project.tracks.map((track) => (
                 <div className={`track-header ${track.kind} ${track.locked ? "locked" : ""}`} key={track.id}>
                   <button aria-label={`Route incoming ${track.kind} media to ${track.name}`} aria-pressed={destinationRoutes[track.kind] === track.id} className={destinationRoutes[track.kind] === track.id ? "destination-route active" : "destination-route"} onClick={() => setDestinationRoutes((current) => ({...current, [track.kind]: track.id}))} title={track.locked ? `${track.name} is locked · unlock to use as a destination` : `Route incoming ${track.kind} media to ${track.name}`}>{track.name}</button>
-                  <button aria-label={`Target ${track.name} for timeline edits`} aria-pressed={targetedTrackIds.includes(track.id)} className={targetedTrackIds.includes(track.id) ? "track-target active" : "track-target"} onClick={() => setTargetedTrackIds((current) => current.includes(track.id) ? current.filter((id) => id !== track.id) : [...current, track.id])} title={`${targetedTrackIds.includes(track.id) ? "Remove" : "Add"} ${track.name} ${targetedTrackIds.includes(track.id) ? "from" : "to"} edit targets`}>T</button>
-                  <button onClick={() => toggleTrack(track.id, "locked")}>{track.locked ? <Lock size={12} /> : <Unlock size={12} />}</button>
-                  {track.kind !== "audio" ? <button onClick={() => toggleTrack(track.id, "hidden")}>{track.hidden ? <EyeOff size={13} /> : <Eye size={13} />}</button> : <><button className={track.solo ? "track-solo active" : "track-solo"} onClick={() => toggleTrack(track.id, "solo")} title={`Solo ${track.name}`}>S</button><button onClick={() => toggleTrack(track.id, "muted")} title={`Mute ${track.name}`}>{track.muted ? <VolumeX size={13} /> : <Volume2 size={13} />}</button></>}
+                  <button aria-label={`Target ${track.name} for timeline edits`} aria-pressed={targetedTrackIds.includes(track.id)} className={targetedTrackIds.includes(track.id) ? "track-target active" : "track-target"} onClick={() => setTargetedTrackIds((current) => current.includes(track.id) ? current.filter((id) => id !== track.id) : [...current, track.id])} title={`${targetedTrackIds.includes(track.id) ? "Remove" : "Add"} ${track.name} ${targetedTrackIds.includes(track.id) ? "from" : "to"} edit targets`}><Crosshair size={12} /></button>
+                  <button className={track.locked ? "track-lock active" : "track-lock"} onClick={() => toggleTrack(track.id, "locked")} title={`${track.locked ? "Unlock" : "Lock"} ${track.name}`} aria-label={`${track.locked ? "Unlock" : "Lock"} ${track.name}`}>{track.locked ? <Lock size={12} /> : <Unlock size={12} />}</button>
+                  {track.kind !== "audio" ? <button className={track.hidden ? "track-hidden active" : ""} onClick={() => toggleTrack(track.id, "hidden")} title={`${track.hidden ? "Show" : "Hide"} ${track.name}`} aria-label={`${track.hidden ? "Show" : "Hide"} ${track.name}`}>{track.hidden ? <EyeOff size={13} /> : <Eye size={13} />}</button> : <><button className={track.solo ? "track-solo active" : "track-solo"} onClick={() => toggleTrack(track.id, "solo")} title={`Solo ${track.name}`} aria-label={`Solo ${track.name}`}><Headphones size={12} /></button><button className={track.muted ? "track-mute active" : ""} onClick={() => toggleTrack(track.id, "muted")} title={`Mute ${track.name}`} aria-label={`Mute ${track.name}`}>{track.muted ? <VolumeX size={13} /> : <Volume2 size={13} />}</button></>}
                 </div>
               ))}
             </div>
             <div className="timeline-scroll" ref={timelineScrollerRef}>
               <div className="timeline-canvas" style={{width: timelineWidth}}>
                 <div className="ruler" onPointerDown={beginPlayheadScrub}>
-                  {virtualRulerSeconds.map((second) => (
-                    <div className="ruler-mark" key={second} style={{left: second * project.fps * pixelsPerFrame}}><i /><span>{formatTimecode(second * project.fps, project.fps).slice(3, 8)}</span></div>
+                  {rulerTicks.minor.map((tick) => <i className={`ruler-tick${(tick.frame / rulerTicks.minorStep) % 2 === 0 ? " mid" : ""}`} key={`m${tick.frame}`} style={{transform: `translateX(${tick.x}px)`}} />)}
+                  {rulerTicks.major.map((tick) => (
+                    <div className="ruler-mark" key={`M${tick.frame}`} style={{transform: `translateX(${tick.x}px)`}}><span><em>{tick.dim}</em>{tick.label}</span></div>
                   ))}
+                  <div className="ruler-sequence-end" style={{transform: `translateX(${Math.round(sequenceWidth)}px)`}} title={`Sequence end · ${formatTimecode(project.durationInFrames, project.fps)}`} />
                   {project.markers.filter((marker) => frameRangeIntersects(marker.frame, 1, virtualTimelineWindow)).map((marker) => (
                     <button
                       className="timeline-marker"
@@ -3484,6 +3579,11 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
                       onDoubleClick={() => commit((draft) => {draft.markers = draft.markers.filter((item) => item.id !== marker.id);}, `Removed ${marker.label}`)}
                     />
                   ))}
+                </div>
+                <div className="timeline-grid" aria-hidden="true">
+                  {rulerTicks.minor.map((tick) => <i key={`m${tick.frame}`} style={{transform: `translateX(${tick.x}px)`}} />)}
+                  {rulerTicks.major.map((tick) => <i className="major" key={`M${tick.frame}`} style={{transform: `translateX(${tick.x}px)`}} />)}
+                  <div className="timeline-out-of-range" style={{left: Math.round(sequenceWidth)}} />
                 </div>
                 <div className="tracks">
                   {project.tracks.map((track) => (
@@ -3510,8 +3610,8 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
                         <div
                           key={clip.id}
                           data-clip-id={clip.id}
-                          className={`timeline-clip ${clip.kind} ${selectedClipIds.includes(clip.id) ? "selected" : ""} ${clip.linkedGroupId ? "linked" : ""}`}
-                          style={{left: clip.start * pixelsPerFrame, width: Math.max(18, clip.duration * pixelsPerFrame), "--clip-color": clip.color} as React.CSSProperties}
+                          className={`timeline-clip ${clip.kind} ${selectedClipIds.includes(clip.id) ? "selected" : ""} ${clip.linkedGroupId ? "linked" : ""}${clip.duration * pixelsPerFrame < 16 ? " micro" : clip.duration * pixelsPerFrame < 44 ? " compact" : ""}`}
+                          style={{left: Math.round(clip.start * pixelsPerFrame), width: Math.max(3, Math.round((clip.start + clip.duration) * pixelsPerFrame) - Math.round(clip.start * pixelsPerFrame)), "--clip-color": clip.color} as React.CSSProperties}
                           onPointerDown={(event) => {
                             if (track.locked) return;
                             const mode: DragMode = activeTool === "slip" ? "slip" : activeTool === "slide" ? "slide" : activeTool === "roll" ? "roll-end" : "move";
@@ -3565,7 +3665,7 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
                             key={transition.id}
                             data-transition-id={transition.id}
                             className={`timeline-transition ${selectedTransitionId === transition.id ? "selected" : ""}`}
-                            style={{left: (toClip.start - transition.duration / 2) * pixelsPerFrame, width: Math.max(22, transition.duration * pixelsPerFrame)} as React.CSSProperties}
+                            style={{left: Math.round((toClip.start - transition.duration / 2) * pixelsPerFrame), width: Math.max(12, Math.round(transition.duration * pixelsPerFrame))} as React.CSSProperties}
                             onPointerDown={(event) => event.stopPropagation()}
                             onClick={(event) => {
                               event.stopPropagation();
@@ -3590,7 +3690,7 @@ export const EditorApp: React.FC<EditorAppProps> = ({projectId, initialProject, 
                 {marquee && (
                   <div className="selection-marquee" style={{left: Math.min(marquee.startX, marquee.x), top: Math.min(marquee.startY, marquee.y), width: Math.abs(marquee.x - marquee.startX), height: Math.abs(marquee.y - marquee.startY)}} />
                 )}
-                <div className={`playhead ${scrubbing ? "scrubbing" : ""}`} style={{left: frame * pixelsPerFrame}} onPointerDown={beginPlayheadScrub} title="Drag to scrub the playhead"><div /><span /></div>
+                <div className={`playhead ${scrubbing ? "scrubbing" : ""}`} style={{transform: `translateX(${Math.round(frame * pixelsPerFrame)}px)`}} onPointerDown={beginPlayheadScrub} title="Drag to scrub the playhead"><div /><span />{scrubbing && <b>{formatTimecode(frame, project.fps)}</b>}</div>
               </div>
             </div>
           </div>
@@ -3625,14 +3725,25 @@ const SimpleProperty: React.FC<{label: string; value: number; suffix?: string; o
   <label className="property simple-property"><span>{label}</span><div><input type="number" min={0} value={Math.round(value)} onChange={(event) => onChange(Number(event.target.value))} />{suffix && <i>{suffix}</i>}</div></label>
 );
 
+const effectCategoryIcon = (category: string) => {
+  if (category === "color") return <Sun size={14} />;
+  if (category === "blur") return <Droplets size={14} />;
+  if (category === "distort") return <Aperture size={14} />;
+  if (category === "generate") return <Sparkles size={14} />;
+  if (category === "stylize") return <Shapes size={14} />;
+  return <WandSparkles size={14} />;
+};
+
+const rangeFill = (value: number, min: number, max: number) => ({"--fill": `${max > min ? Math.min(100, Math.max(0, ((value - min) / (max - min)) * 100)) : 0}%`}) as React.CSSProperties;
+
 const ColorControl: React.FC<{label: string; value: number; min: number; max: number; step?: number; suffix?: string; onChange: (value: number) => void}> = ({label, value, min, max, step = 1, suffix, onChange}) => (
   <label className="color-control">
     <span>{label}</span>
-    <input aria-label={label} type="range" min={min} max={max} step={step} value={value} onChange={(event) => onChange(Number(event.target.value))} />
+    <input aria-label={label} type="range" min={min} max={max} step={step} value={value} style={rangeFill(value, min, max)} onChange={(event) => onChange(Number(event.target.value))} />
     <b>{Math.round(value * 100) / 100}{suffix}</b>
   </label>
 );
 
 const Slider: React.FC<{label: string; value: number; min: number; max: number; step?: number; suffix?: string; keyframe: KeyframeControlState; onToggleKeyframe: () => void; onChange: (value: number) => void}> = ({label, value, min, max, step = 1, suffix, keyframe, onToggleKeyframe, onChange}) => (
-  <label className="slider-property"><span><em>{label}</em><span><b>{Math.round(value * 10) / 10}{suffix}</b><KeyframeButton state={keyframe} onClick={onToggleKeyframe} /></span></span><input type="range" min={min} max={max} step={step} value={value} onChange={(event) => onChange(Number(event.target.value))} /></label>
+  <label className="slider-property"><span><em>{label}</em><span><b>{Math.round(value * 10) / 10}{suffix}</b><KeyframeButton state={keyframe} onClick={onToggleKeyframe} /></span></span><input type="range" min={min} max={max} step={step} value={value} style={rangeFill(value, min, max)} onChange={(event) => onChange(Number(event.target.value))} /></label>
 );

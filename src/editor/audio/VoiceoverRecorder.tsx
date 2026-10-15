@@ -1,4 +1,5 @@
 import {useCallback, useState} from "react";
+import {Circle, Mic, Square, X} from "lucide-react";
 import {useVoiceoverRecorder, type VoiceoverRecording} from "./useVoiceoverRecorder";
 
 export type VoiceoverUpload = {src: string; fileName: string; mimeType: string; size: number};
@@ -39,10 +40,11 @@ export const VoiceoverRecorder = ({onRecorded, onUploaded, onError, upload = upl
   }, [onError, onRecorded, onUploaded, upload]);
   const recorder = useVoiceoverRecorder({onRecording: handleRecording, onError: (value) => onError?.(value.message)});
   return <section className="dc-voiceover" aria-label="Voiceover recorder">
+    <span className={`dc-voiceover-icon ${recorder.status}`}><Mic size={15} /></span>
     <header><strong>Voiceover</strong><span>{recorder.status === "requesting" ? "Waiting for microphone permission" : recorder.status}</span></header>
-    {recorder.status === "idle" || recorder.status === "ready" || recorder.status === "error" ? <button type="button" disabled={uploading} onClick={() => void recorder.start()}>Record</button> : null}
+    {recorder.status === "idle" || recorder.status === "ready" || recorder.status === "error" ? <button type="button" disabled={uploading} onClick={() => void recorder.start()}><Circle size={9} fill="currentColor" className="dc-record-dot" /> Record</button> : null}
     {recorder.status === "requesting" ? <button type="button" onClick={recorder.cancel}>Cancel request</button> : null}
-    {recorder.status === "recording" ? <><button type="button" onClick={recorder.stop}>Stop and add</button><button type="button" onClick={recorder.cancel}>Discard</button></> : null}
+    {recorder.status === "recording" ? <><button type="button" onClick={recorder.stop}><Square size={9} fill="currentColor" /> Stop and add</button><button type="button" onClick={recorder.cancel} title="Discard take" aria-label="Discard take"><X size={12} /></button></> : null}
     {recorder.status === "stopping" || uploading ? <progress aria-label={uploading ? "Uploading voiceover" : "Finishing voiceover"} /> : null}
     {recorder.error ? <p role="alert">{recorder.error.message}</p> : null}
     {uploadError ? <p role="alert">{uploadError}</p> : null}

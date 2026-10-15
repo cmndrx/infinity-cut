@@ -1,4 +1,5 @@
 import {useMemo, useState} from "react";
+import {SlidersVertical} from "lucide-react";
 import type {EditorTrack, ProjectAudioSettings} from "../types";
 import {normalizeProjectAudioSettings, normalizeTrackAudio} from "./project-audio";
 import {AudioProcessorRack} from "./AudioProcessorRack";
@@ -24,7 +25,7 @@ export const AudioMixerPanel = ({tracks, settings: rawSettings, onTracksChange, 
   const patchBus = (patch: Partial<NonNullable<typeof selectedBus>>) => onSettingsChange({...settings, buses: settings.buses.map((bus) => bus.id === selectedBus?.id ? {...bus, ...patch} : bus)});
 
   return <section className="dc-audio-mixer" aria-label="Professional audio mixer">
-    <header><div><strong>Audio Track Mixer</strong><span>{(settings.sampleRate / 1000).toFixed(settings.sampleRate % 1000 ? 1 : 0)} kHz · live processor preview</span></div></header>
+    <header><span className="dc-audio-mixer-icon"><SlidersVertical size={15} /></span><div><strong>Audio Track Mixer</strong><span>{(settings.sampleRate / 1000).toFixed(settings.sampleRate % 1000 ? 1 : 0)} kHz · live processor preview</span></div></header>
     <nav aria-label="Mixer channels">
       {audioTracks.map((track) => <button type="button" aria-pressed={selection === `track:${track.id}`} key={track.id} onClick={() => setSelection(`track:${track.id}`)}>{track.name}</button>)}
       {settings.buses.map((bus) => <button type="button" aria-pressed={selection === `bus:${bus.id}`} key={bus.id} onClick={() => setSelection(`bus:${bus.id}`)}>{bus.name}</button>)}
